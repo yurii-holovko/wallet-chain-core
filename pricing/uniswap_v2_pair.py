@@ -71,7 +71,15 @@ class UniswapV2Pair:
         denominator = reserve_in * 10000 + amount_in_with_fee
         amount_out = numerator // denominator
         """
+        if not isinstance(amount_in, int):
+            raise TypeError("amount_in must be int")
+        if amount_in <= 0:
+            raise ValueError("amount_in must be positive")
+
         reserve_in, reserve_out, _ = self._select_reserves_for_input(token_in)
+        if reserve_in <= 0 or reserve_out <= 0:
+            raise ValueError("reserves must be positive")
+
         fee_bps = self.fee_bps
         amount_in_with_fee = amount_in * (10000 - fee_bps)
         numerator = amount_in_with_fee * reserve_out
@@ -84,7 +92,17 @@ class UniswapV2Pair:
         Calculate required input for desired output.
         (Inverse of get_amount_out)
         """
+        if not isinstance(amount_out, int):
+            raise TypeError("amount_out must be int")
+        if amount_out <= 0:
+            raise ValueError("amount_out must be positive")
+
         reserve_in, reserve_out = self._select_reserves_for_output(token_out)
+        if reserve_in <= 0 or reserve_out <= 0:
+            raise ValueError("reserves must be positive")
+        if amount_out >= reserve_out:
+            raise ValueError("amount_out must be less than reserve_out")
+
         fee_bps = self.fee_bps
         numerator = amount_out * reserve_in * 10000
         denominator = (reserve_out - amount_out) * (10000 - fee_bps)
@@ -113,6 +131,8 @@ class UniswapV2Pair:
         """
         spot = self.get_spot_price(token_in)
         execution = self.get_execution_price(amount_in, token_in)
+        if spot == 0:
+            return Decimal(0)
         return (spot - execution) / spot
 
     def simulate_swap(self, amount_in: int, token_in: Token) -> "UniswapV2Pair":
@@ -124,7 +144,8 @@ class UniswapV2Pair:
         reserve_in, reserve_out, token_in_is_token0 = self._select_reserves_for_input(
             token_in
         )
-
+        if reserve_in <= 0 or reserve_out <= 0:
+            raise ValueError("reserves must be positive")
         if amount_out > reserve_out:
             raise ValueError("insufficient liquidity for this trade")
 

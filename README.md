@@ -1,7 +1,4 @@
-# Wallet Chain Core (Week 1)
-
-Part 1 implements secure wallet management, canonical serialization, and base
-types used across the project. A CLI wraps these features for quick testing.
+# Wallet Chain Core
 
 ## Quick Start
 
@@ -17,6 +14,12 @@ PowerShell:
 $env:PRIVATE_KEY = "0xYOUR_PRIVATE_KEY"  # pragma: allowlist secret
 make run
 ```
+
+<details>
+<summary><span style="font-size:1.25em"><strong>Week 1: Wallet + Chain</strong></span></summary>
+
+Part 1 implements secure wallet management, canonical serialization, and base
+types used across the project. A CLI wraps these features for quick testing.
 
 ## Getting Started
 
@@ -332,3 +335,23 @@ Test coverage:
 - [x] Client: retry logic, error classification
 - [x] Builder: validation, gas estimation
 - [x] Analyzer: parsing, decoding, edge cases
+
+</details>
+
+<details>
+<summary><span style="font-size:1.25em"><strong>Week 2: Pricing</strong></span></summary>
+
+### Overview
+Pricing module for AMM math, routing, simulation, and mempool monitoring.
+
+### Modules
+- `pricing/uniswap_v2_pair.py`: Uniswap V2 pair math and helpers
+- `pricing/route.py`: route modeling and route finding
+- `pricing/fork_simulator.py`: swap/route simulation on forked RPC
+- `pricing/mempool_monitor.py`: mempool swap parsing/monitoring
+- `pricing/pricing_engine.py`: orchestration entry point
+
+### Status
+Work in progress; interfaces may change as Week 2 evolves.
+
+</details>

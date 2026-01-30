@@ -52,6 +52,25 @@ def test_integer_math_no_floats():
     assert isinstance(out, int)
 
 
+def test_fee_calculation_matches_formula():
+    pair = _make_pair(reserve0=1000 * 10**18, reserve1=2_000_000 * 10**6)
+    amount_in = 2000 * 10**6
+    reserve_in = pair.reserve1
+    reserve_out = pair.reserve0
+    amount_in_with_fee = amount_in * (10000 - pair.fee_bps)
+    numerator = amount_in_with_fee * reserve_out
+    denominator = reserve_in * 10000 + amount_in_with_fee
+    expected = numerator // denominator
+
+    assert pair.get_amount_out(amount_in, USDC) == expected
+
+
+def test_known_onchain_style_result():
+    pair = _make_pair(reserve0=1000 * 10**18, reserve1=2_000_000 * 10**6)
+    amount_in = 2000 * 10**6
+    assert pair.get_amount_out(amount_in, USDC) == 996006981039903216
+
+
 def test_swap_is_immutable():
     """simulate_swap doesn't modify original."""
     pair = _make_pair(reserve0=1000 * 10**18, reserve1=2_000_000 * 10**6)

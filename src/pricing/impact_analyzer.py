@@ -22,6 +22,10 @@ def _parse_sizes(value: str, decimals: int) -> list[int]:
     return sizes
 
 
+def _format_token_amount(raw: int, token: Token, decimals: int = 6) -> str:
+    return _format_amount(Decimal(raw) / Decimal(10**token.decimals), decimals=decimals)
+
+
 def _select_token(pair: UniswapV2Pair, token_in: str) -> Token:
     lowered = token_in.strip().lower()
     if lowered.startswith("0x"):
@@ -49,7 +53,7 @@ def _print_table(
     spot_price: Decimal,
     pair: UniswapV2Pair,
 ):
-    header = f"Price Impact Analysis for {token_in.symbol} \u2192 {token_out.symbol}"
+    header = f"Price Impact Analysis for {token_in.symbol} -> {token_out.symbol}"
     print(header)
     print(f"Pool: {pair.address.checksum}")
 
@@ -73,17 +77,17 @@ def _print_table(
         "Impact",
     ]
     widths = [13, 13, 13, 10]
-    sep = "\u250c" + "\u252c".join("\u2500" * w for w in widths) + "\u2510"
-    mid = "\u251c" + "\u253c".join("\u2500" * w for w in widths) + "\u2524"
-    end = "\u2514" + "\u2534".join("\u2500" * w for w in widths) + "\u2518"
+
+    def sep(char: str) -> str:
+        return "+" + "+".join(char * w for w in widths) + "+"
 
     def row(values: list[str]) -> str:
         padded = [values[i].rjust(widths[i]) for i in range(len(values))]
-        return "\u2502" + "\u2502".join(padded) + "\u2502"
+        return "|" + "|".join(padded) + "|"
 
-    print(sep)
+    print(sep("-"))
     print(row(columns))
-    print(mid)
+    print(sep("-"))
     for entry in rows:
         amount_in = Decimal(entry["amount_in"]) / Decimal(10**token_in.decimals)
         amount_out = Decimal(entry["amount_out"]) / Decimal(10**token_out.decimals)
@@ -99,7 +103,7 @@ def _print_table(
                 ]
             )
         )
-    print(end)
+    print(sep("-"))
 
 
 def main() -> None:

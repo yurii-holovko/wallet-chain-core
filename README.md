@@ -79,6 +79,12 @@ src/
     client.py           # RPC client with retries and error handling
     transaction_builder.py  # fluent transaction builder
     analyzer.py         # tx analysis CLI
+  pricing/
+    uniswap_v2_pair.py  # Uniswap V2 pair math + on-chain helpers
+    route.py            # routing + gas-aware selection
+    fork_simulator.py   # forked swap simulation
+    mempool_monitor.py  # pending tx watcher
+    impact_analyzer.py  # price impact CLI
   main.py               # CLI entrypoint
 docs/
   examples/             # sample JSON payloads for CLI
@@ -346,14 +352,131 @@ Test coverage:
 ### Overview
 Pricing module for AMM math, routing, simulation, and mempool monitoring.
 
+### Architecture
+```
+MempoolMonitor ──▶ ParsedSwap ──▶ PricingEngine ──┐
+                                                   ├─▶ RouteFinder ──▶ Route
+                                                   ├─▶ UniswapV2Pair (math)
+                                                   └─▶ ForkSimulator (forked sim)
+```
+
 ### Modules
 - `src/pricing/uniswap_v2_pair.py`: Uniswap V2 pair math and helpers
 - `src/pricing/route.py`: route modeling and route finding
 - `src/pricing/fork_simulator.py`: swap/route simulation on forked RPC
 - `src/pricing/mempool_monitor.py`: mempool swap parsing/monitoring
 - `src/pricing/pricing_engine.py`: orchestration entry point
+- `src/pricing/impact_analyzer.py`: price impact CLI
+- `src/pricing/price_impact_analyzer.py`: price impact math utilities
 
-### Status
-Work in progress; interfaces may change as Week 2 evolves.
+### Setup
+Start a local fork (requires Foundry/Anvil):
+```bash
+export ETH_RPC_URL="https://mainnet.example"
+bash scripts/start_fork.sh
+```
+Install Foundry (Git Bash):
+```bash
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
+```
+
+Set RPC/WS endpoints (or copy from `env.example`):
+```bash
+export RPC_URL="https://mainnet.example"
+export WS_URL="wss://mainnet.example"
+```
+For the mempool watcher script:
+```bash
+export WS_URL="wss://mainnet.example"
+```
+PowerShell convenience loader:
+```powershell
+.\scripts\load_env.ps1 -EnvFile .env
+```
+
+### Examples
+```bash
+python -m pricing.impact_analyzer 0xPairAddress --token-in USDC --sizes 1000,10000 --rpc $RPC_URL
+```
+
+```python
+async def main():
+    def on_swap(swap: ParsedSwap):
+        print(f\"Detected swap: {swap.dex} {swap.method}\")
+        print(f\"  {swap.amount_in} → min {swap.min_amount_out}\")
+        print(f\"  Slippage tolerance: {swap.slippage_tolerance:.2%}\")
+
+    monitor = MempoolMonitor(WS_URL, on_swap)
+    await monitor.start()
+```
+
+```python
+client = ChainClient([RPC_URL])
+engine = PricingEngine(client, "http://127.0.0.1:8545", WS_URL)
+engine.load_pools([Address.from_string("0xPairAddress")])
+quote = engine.get_quote(token_in, token_out, amount_in, gas_price_gwei=10, sender=sender)
+print(quote.expected_output, quote.simulated_output)
+```
+
+### Demo Runbook (Week 2)
+1) Load env vars:
+```powershell
+.\scripts\load_env.ps1 -EnvFile .env
+```
+
+2) Start the fork (Git Bash):
+```bash
+export ETH_RPC_URL="https://mainnet.example"
+bash scripts/start_fork.sh
+```
+
+3) Start mempool watcher (PowerShell):
+```powershell
+$env:WS_URL = "ws://127.0.0.1:8545"
+python scripts/watch_mempool.py
+```
+
+4) Send a test swap on the fork (PowerShell):
+```powershell
+$env:ANVIL_SENDER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+python scripts/send_test_swap.py
+```
+
+5) Show price impact table (mainnet pool):
+```powershell
+python -m pricing.impact_analyzer `
+  0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc `
+  --token-in USDC `
+  --sizes 1000,10000,100000 `
+  --rpc $env:RPC_URL
+```
+
+6) Show best route with gas flip:
+```powershell
+python scripts/demo_route.py
+```
+
+7) Show Solidity-matching math (tests):
+```powershell
+pytest tests/test_uniswap_v2_pair.py
+```
+
+### Tests
+```bash
+pytest tests/test_uniswap_v2_pair.py
+pytest tests/test_route.py
+pytest tests/test_price_impact_analyzer.py
+pytest tests/test_mempool_monitor.py
+```
+
+### Checklist (Week 2)
+- AMM math: integer-only, matches Solidity outputs
+- Routing: multi-hop discovery with gas-aware selection
+- Monitoring: pending tx watcher + swap decoding
+- Simulation: forked swap execution + receipt parsing
+- CLI: price impact analyzer output
+- Docs: architecture + examples
+
 
 </details>

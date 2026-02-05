@@ -386,6 +386,7 @@ Set RPC/WS endpoints (or copy from `env.example`):
 export RPC_URL="https://mainnet.example"
 export WS_URL="wss://mainnet.example"
 ```
+Environment loading is centralized in `config.py`: all entrypoints call `config.get_env()` which loads `.env` once via `python-dotenv`. You can still export env vars, but `.env` works automatically.
 For the mempool watcher script:
 ```bash
 export WS_URL="wss://mainnet.example"
@@ -394,6 +395,9 @@ PowerShell convenience loader:
 ```powershell
 .\scripts\load_env.ps1 -EnvFile .env
 ```
+
+### Configuration
+All entrypoints load environment variables via `config.get_env()` which lazily loads `.env` once. Prefer `config.get_env("NAME", required=True)` instead of `os.environ.get()` to keep configuration consistent and avoid leaking sensitive values in errors.
 
 ### Examples
 ```bash

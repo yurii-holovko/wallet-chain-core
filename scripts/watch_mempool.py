@@ -1,12 +1,9 @@
 import asyncio
-import os
 
+import config
 from pricing.mempool_monitor import MempoolMonitor
 
-WS_URL_VALUE = os.environ.get("WS_URL")
-if not WS_URL_VALUE:
-    raise SystemExit("WS_URL env var is required (e.g. wss://... )")
-WS_URL = WS_URL_VALUE
+WS_URL = config.get_env("WS_URL", required=True)
 
 
 def on_swap(swap):

@@ -1,7 +1,8 @@
-import os
 import time
 
 from web3 import Web3
+
+import config
 
 ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
@@ -25,14 +26,14 @@ ABI = [
 
 
 def main() -> None:
-    rpc_url = os.environ.get("FORK_RPC_URL", "http://127.0.0.1:8545")
-    sender = os.environ.get("ANVIL_SENDER")
+    rpc_url = config.get_env("FORK_RPC_URL", "http://127.0.0.1:8545")
+    sender = config.get_env("ANVIL_SENDER")
     if not sender:
         raise SystemExit("ANVIL_SENDER is required (use one of Anvil's accounts)")
 
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     if not w3.is_connected():
-        raise SystemExit(f"Failed to connect to {rpc_url}")
+        raise SystemExit("Failed to connect to RPC")
 
     contract = w3.eth.contract(address=ROUTER, abi=ABI)
     deadline = int(time.time()) + 600

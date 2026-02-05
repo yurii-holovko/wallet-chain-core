@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import os
 from decimal import Decimal
 
+import config
 from chain.client import ChainClient
 from core.base_types import Address
 
@@ -123,7 +123,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rpc_url = args.rpc or os.environ.get("RPC_URL")
+    rpc_url = args.rpc or config.get_env("RPC_URL")
     if not rpc_url:
         raise SystemExit("RPC URL required via --rpc or RPC_URL env var")
 

@@ -26,6 +26,7 @@ pycodestyle==2.14.0
 pyflakes==3.4.0
 Pygments==2.19.2
 pytest==9.0.2
+python-dotenv==1.0.1
 pytokens==0.3.0
 PyYAML==6.0.3
 requests==2.32.5

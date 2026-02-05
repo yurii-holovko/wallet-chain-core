@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from decimal import Decimal
 
 from eth_account import Account
 
+import config
 from chain import ChainClient
 from core.base_types import Address, TokenAmount, TransactionRequest
 from core.wallet_manager import WalletManager
@@ -16,15 +16,9 @@ SEPOLIA_CHAIN_ID = 11155111
 
 
 def main() -> None:
-    rpc_url = os.environ.get("SEPOLIA_RPC_URL")
-    if not rpc_url:
-        raise SystemExit("SEPOLIA_RPC_URL is required")
-
-    recipient = os.environ.get("RECIPIENT_ADDRESS")
-    if not recipient:
-        raise SystemExit("RECIPIENT_ADDRESS is required")
-
-    amount = os.environ.get("TRANSFER_AMOUNT", "0.001")
+    rpc_url = config.get_env("SEPOLIA_RPC_URL", required=True)
+    recipient = config.get_env("RECIPIENT_ADDRESS", required=True)
+    amount = config.get_env("TRANSFER_AMOUNT", "0.001")
 
     wallet = WalletManager.from_env()
     client = ChainClient([rpc_url])

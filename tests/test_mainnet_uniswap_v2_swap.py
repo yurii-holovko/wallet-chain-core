@@ -1,9 +1,8 @@
-import os
-
 import pytest
 from eth_abi.abi import decode
 from eth_utils.crypto import keccak
 
+import config
 from chain.client import ChainClient
 from chain.errors import RPCError
 from core.base_types import Address, TokenAmount, TransactionRequest
@@ -93,7 +92,7 @@ def _find_log(logs: list[dict], topic: str, address: Address) -> dict | None:
 
 
 def test_mainnet_uniswap_v2_swap_matches_get_amount_out():
-    rpc_url = os.environ.get("RPC_URL")
+    rpc_url = config.get_env("RPC_URL")
     if not rpc_url:
         pytest.skip("RPC_URL not set")
 

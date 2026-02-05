@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,6 +13,7 @@ from typing import Any
 from eth_abi import decode
 from eth_utils.crypto import keccak
 
+import config
 from core.base_types import Address, TokenAmount, TransactionRequest
 
 from .client import ChainClient
@@ -102,7 +102,7 @@ def main() -> None:
     parser.add_argument("--format", choices=["text", "json"], default="text")
     args = parser.parse_args()
 
-    rpc_url = args.rpc or os.environ.get("RPC_URL")
+    rpc_url = args.rpc or config.get_env("RPC_URL")
     if not rpc_url:
         raise SystemExit("RPC URL required via --rpc or RPC_URL env var")
 

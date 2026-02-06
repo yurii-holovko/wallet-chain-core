@@ -537,7 +537,12 @@ $env:BINANCE_TESTNET_SECRET = "your_secret_here"
 `config.BINANCE_CONFIG` reads env vars via `config.get_env()` and enables the
 Binance sandbox + rate limiting by default.
 
-### Stretch Goal CLIs
+### CLIs (Quick Reference)
+Live order book + analysis:
+```bash
+python -m src.exchange.orderbook ETH/USDT --depth 50 --depth-bps 15 --imbalance-levels 10 --walk-sizes 1,5,10
+```
+
 Live order book (WebSocket):
 ```bash
 python -m src.exchange.orderbook_ws ETH/USDT --ws-mode stream
@@ -551,19 +556,51 @@ Notes:
   `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_SECRET`.
 - Enable debug logs with `ORDERBOOK_WS_DEBUG=1`.
 
-Inventory dashboard (use a balances file, not a keystore):
+LIMIT IOC (testnet):
 ```bash
-python -m inventory.dashboard --interval 5 --wallet-balances docs/examples/wallet_balances.json
+python scripts/demo_ioc.py --symbol ETH/USDT --amount 0.01 --price-multiplier 0.999
+```
+
+Portfolio snapshot (Binance + wallet):
+```bash
+python scripts/demo_snapshot.py --wallet-balances docs/examples/wallet_balances.json
+```
+
+Arb checker (real prices):
+```bash
+python -m src.integration.arb_checker ETH/USDT --size 1 --gas-usd 5 --balances docs/examples/wallet_balances.json
+```
+
+PnL report (5 trades):
+```bash
+python -m src.inventory.pnl --summary --trades docs/examples/pnl_trades.json
+```
+
+Check inventory skew:
+```bash
+python -m src.inventory.rebalancer --check
+```
+
+Generate rebalance plan:
+```bash
+python -m src.inventory.rebalancer --plan ETH
+```
+
+Stretch goals
+
+Real-time inventory dashboard (TUI):
+```bash
+python -m src.inventory.dashboard --interval 5 --wallet-balances docs/examples/wallet_balances.json --wallet-only --nonzero-only
+```
+
+Historical PnL chart export:
+```bash
+python -m src.inventory.pnl --export-chart pnl.png --trades docs/examples/pnl_trades.json
 ```
 
 Arb check with CSV logging:
 ```bash
-python -m integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-min-bps 0
-```
-
-PnL chart export:
-```bash
-python -m inventory.pnl --export-chart pnl.png
+python -m src.integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-min-bps 0
 ```
 
 ### Definition of Done

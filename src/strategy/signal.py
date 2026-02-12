@@ -1,6 +1,8 @@
+"""Arbitrage signal dataclass and direction enum."""
+
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -32,6 +34,10 @@ class Signal:
 
     inventory_ok: bool
     within_limits: bool
+
+    # Optional metadata for debugging / audit trail
+    rejection_reasons: list[str] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)
 
     @classmethod
     def create(cls, pair: str, direction: Direction, **kwargs) -> "Signal":

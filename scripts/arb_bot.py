@@ -13,6 +13,7 @@ from core.base_types import Address, TokenAmount, TransactionRequest  # noqa: E4
 from core.wallet_manager import WalletManager  # noqa: E402
 from exchange.client import ExchangeClient  # noqa: E402
 from executor.engine import Executor, ExecutorConfig, ExecutorState  # noqa: E402
+from executor.recovery import RecoveryConfig  # noqa: E402
 from inventory.tracker import InventoryTracker, Venue  # noqa: E402
 from strategy.fees import FeeStructure  # noqa: E402
 from strategy.generator import SignalGenerator  # noqa: E402
@@ -73,6 +74,7 @@ class ArbBot:
                 dex_weth_address=config.get("dex_weth_address"),
                 dex_quote_token_address=config.get("dex_quote_token_address"),
             ),
+            recovery_config=RecoveryConfig(),
         )
 
         self.pairs = config.get("pairs", ["ETH/USDT"])
@@ -93,11 +95,19 @@ class ArbBot:
                 await asyncio.sleep(5)
 
     async def _tick(self):
+        recovery = self.executor.recovery
+
         if self.executor.circuit_breaker.is_open():
-            logging.info("Circuit breaker open")
+            reset_in = self.executor.circuit_breaker.time_until_reset()
+            logging.info("Circuit breaker open — reset in %.0fs", reset_in)
             return
 
         for pair in self.pairs:
+            # Per-pair circuit breaker check
+            if self.executor.circuit_breaker.is_open(pair):
+                logging.info("CB open for %s — skipping", pair)
+                continue
+
             signal = self.generator.generate(pair, self.trade_size)
             if signal is None:
                 continue
@@ -113,7 +123,7 @@ class ArbBot:
                 f"Signal: {pair} spread={signal.spread_bps:.1f}bps score={signal.score}"
             )
 
-            # Execute
+            # Execute (pre-flight + replay handled inside executor)
             ctx = await self.executor.execute(signal)
 
             # Record result for scorer history
@@ -131,10 +141,11 @@ class ArbBot:
                 )
             else:
                 logging.warning(
-                    "FAILED %s  error=%s  unwind=%s",
+                    "FAILED %s  error=%s  unwind=%s  cb=%s",
                     pair,
                     ctx.error,
                     ctx.metrics.unwind_success,
+                    recovery.snapshot(pair)["circuit_breaker"],
                 )
 
             await self._sync_balances()

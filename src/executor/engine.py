@@ -35,7 +35,7 @@ from eth_utils import keccak
 from chain import ChainClient, TransactionBuilder
 from core.base_types import Address, TokenAmount, TransactionRequest
 from core.wallet_manager import WalletManager
-from executor.recovery import CircuitBreaker, ReplayProtection
+from executor.recovery import RecoveryConfig, RecoveryManager
 from strategy.signal import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -276,14 +276,17 @@ class Executor:
         pricing_module,
         inventory_tracker,
         config: Optional[ExecutorConfig] = None,
+        recovery_config: Optional[RecoveryConfig] = None,
     ):
         self.exchange = exchange_client
         self.pricing = pricing_module
         self.inventory = inventory_tracker
         self.config = config or ExecutorConfig()
 
-        self.circuit_breaker = CircuitBreaker()
-        self.replay_protection = ReplayProtection()
+        self.recovery = RecoveryManager(recovery_config)
+        # Convenience aliases so existing code keeps working
+        self.circuit_breaker = self.recovery.circuit_breaker
+        self.replay_protection = self.recovery.replay
         self._dex_client: Optional[ChainClient] = None
         self._dex_wallet: Optional[WalletManager] = None
 
@@ -305,17 +308,11 @@ class Executor:
         ctx = ExecutionContext(signal=signal)
         self._total_executions += 1
 
-        # ── pre-flight gates ──────────────────────────────────
-        if self.circuit_breaker.is_open():
-            ctx.transition(ExecutorState.FAILED, "Circuit breaker open")
-            ctx.error = "Circuit breaker open"
-            ctx.finished_at = time.time()
-            self._failed += 1
-            return ctx
-
-        if self.replay_protection.is_duplicate(signal):
-            ctx.transition(ExecutorState.FAILED, "Duplicate signal")
-            ctx.error = "Duplicate signal"
+        # ── pre-flight gates (delegated to RecoveryManager) ──
+        allowed, reason = self.recovery.pre_flight(signal)
+        if not allowed:
+            ctx.transition(ExecutorState.FAILED, reason)
+            ctx.error = reason
             ctx.finished_at = time.time()
             self._failed += 1
             return ctx
@@ -336,16 +333,16 @@ class Executor:
             ctx = await self._execute_cex_first(ctx)
 
         # ── record result ─────────────────────────────────────
-        self.replay_protection.mark_executed(signal)
         ctx.finished_at = time.time()
         ctx.metrics.total_latency_ms = ctx.duration_ms
+        net_pnl = ctx.actual_net_pnl or 0.0
 
         if ctx.state == ExecutorState.DONE:
-            self.circuit_breaker.record_success()
+            self.recovery.record_outcome(signal, True, pnl=net_pnl)
             self._successful += 1
-            self._total_pnl += ctx.actual_net_pnl or 0.0
+            self._total_pnl += net_pnl
         else:
-            self.circuit_breaker.record_failure()
+            self.recovery.record_outcome(signal, False, ctx.error, pnl=net_pnl)
             self._failed += 1
 
         logger.info(
@@ -371,6 +368,7 @@ class Executor:
             ),
             "total_pnl": round(self._total_pnl, 4),
             "circuit_breaker_open": self.circuit_breaker.is_open(),
+            "recovery": self.recovery.snapshot(),
         }
 
     # ── CEX-first flow ────────────────────────────────────────

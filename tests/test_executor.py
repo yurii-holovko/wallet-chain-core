@@ -361,7 +361,7 @@ class TestPreFlightGates:
         ctx = await executor.execute(_make_signal())
 
         assert ctx.state == ExecutorState.FAILED
-        assert "Circuit breaker" in ctx.error
+        assert "circuit breaker" in ctx.error.lower()
         assert len(ctx.events) == 1  # IDLE → FAILED
         assert ctx.events[0].to_state == ExecutorState.FAILED
 
@@ -374,7 +374,7 @@ class TestPreFlightGates:
 
         ctx2 = await executor.execute(sig)
         assert ctx2.state == ExecutorState.FAILED
-        assert "Duplicate" in ctx2.error
+        assert "duplicate" in ctx2.error.lower()
 
     @pytest.mark.asyncio
     async def test_invalid_signal_rejected(self):

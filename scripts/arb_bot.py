@@ -116,13 +116,26 @@ class ArbBot:
             # Execute
             ctx = await self.executor.execute(signal)
 
-            # Record result
-            self.scorer.record_result(pair, ctx.state == ExecutorState.DONE)
+            # Record result for scorer history
+            success = ctx.state == ExecutorState.DONE
+            self.scorer.record_result(pair, success)
 
-            if ctx.state == ExecutorState.DONE:
-                logging.info(f"SUCCESS: PnL=${ctx.actual_net_pnl:.2f}")
+            if success:
+                logging.info(
+                    "SUCCESS %s  PnL=$%.4f  duration=%.0fms  retries=%d/%d",
+                    pair,
+                    ctx.actual_net_pnl or 0,
+                    ctx.duration_ms or 0,
+                    ctx.metrics.leg1_retries,
+                    ctx.metrics.leg2_retries,
+                )
             else:
-                logging.warning(f"FAILED: {ctx.error}")
+                logging.warning(
+                    "FAILED %s  error=%s  unwind=%s",
+                    pair,
+                    ctx.error,
+                    ctx.metrics.unwind_success,
+                )
 
             await self._sync_balances()
 

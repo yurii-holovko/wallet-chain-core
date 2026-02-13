@@ -132,8 +132,9 @@ class TransactionRequest:
             "to": self.to.checksum,
             "value": self.value.raw,
             "data": f"0x{self.data.hex()}",
-            "chainId": self.chain_id,
         }
+        if self.chain_id:
+            payload["chainId"] = self.chain_id
         if self.nonce is not None:
             payload["nonce"] = self.nonce
         if self.gas_limit is not None:

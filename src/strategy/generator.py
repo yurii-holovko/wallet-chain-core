@@ -54,8 +54,8 @@ class SignalGenerator:
         self.fees = fee_structure
 
         # ── tunables ────────────────────────────────────────────
-        self.min_spread_bps: float = config.get("min_spread_bps", 50)
-        self.min_profit_usd: float = config.get("min_profit_usd", 5.0)
+        self.min_spread_bps: float = config.get("min_spread_bps", 30)
+        self.min_profit_usd: float = config.get("min_profit_usd", 0.50)
         self.max_position_usd: float = config.get("max_position_usd", 10_000)
         self.signal_ttl: float = config.get("signal_ttl_seconds", 5)
         self.cooldown: float = config.get("cooldown_seconds", 2)
@@ -78,7 +78,7 @@ class SignalGenerator:
         """
         # Gate 1: cooldown — avoid hammering the same pair
         if self._in_cooldown(pair):
-            logger.debug("%s  skip: cooldown active", pair)
+            logger.info("No signal: %s  cooldown active", pair)
             return None
 
         # Gate 2: fetch live prices
@@ -99,8 +99,8 @@ class SignalGenerator:
         net_pnl = gross_pnl - fees
 
         if net_pnl < self.min_profit_usd:
-            logger.debug(
-                "%s  skip: net_pnl $%.2f < min $%.2f  "
+            logger.info(
+                "No signal: %s  net_pnl $%.2f < min $%.2f  "
                 "(spread=%.1f bps, fees=%.1f bps)",
                 pair,
                 net_pnl,
@@ -275,7 +275,7 @@ class SignalGenerator:
             return Direction.BUY_DEX_SELL_CEX, spread_b, cex_bid, dex_buy
 
         logger.debug(
-            "%s  skip: no spread above min  " "A=%.1f bps  B=%.1f bps  (min=%s)",
+            "No signal: %s  spread A=%.1fbps B=%.1fbps (min=%s)",
             pair,
             spread_a,
             spread_b,

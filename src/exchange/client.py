@@ -51,6 +51,7 @@ class ExchangeClient:
     _RETRYABLE_ERRORS = (
         ccxt.DDoSProtection,
         ccxt.ExchangeNotAvailable,
+        ccxt.InvalidNonce,
         ccxt.NetworkError,
         ccxt.RateLimitExceeded,
         ccxt.RequestTimeout,
@@ -70,7 +71,28 @@ class ExchangeClient:
         max_weight = int(config.get("max_weight_per_minute", 1200))
         window_seconds = float(config.get("weight_window_seconds", 60.0))
         self._rate_limiter = RateLimiter(max_weight, window_seconds)
+        self._sync_server_time()
         self._validate_connection()
+
+    def _sync_server_time(self) -> None:
+        """
+        Measure the offset between local clock and Binance server clock,
+        then tell ccxt to adjust all request timestamps accordingly.
+
+        Binance rejects signed requests when the timestamp differs by more
+        than ``recvWindow`` ms (error code -1021 / InvalidNonce).
+        """
+        try:
+            server_ts = self._exchange.fetch_time()  # epoch-ms from Binance
+            local_ts = int(time.time() * 1000)
+            offset_ms = server_ts - local_ts
+            self._exchange.options["adjustForTimeDifference"] = True
+            self._exchange.options["timeDifference"] = offset_ms
+            self._logger.info("Clock sync: server-local offset = %+d ms", offset_ms)
+        except Exception as exc:
+            self._logger.warning(
+                "Clock sync failed, continuing with local time: %s", exc
+            )
 
     def _validate_connection(self) -> None:
         try:
@@ -91,14 +113,14 @@ class ExchangeClient:
         while True:
             try:
                 self._rate_limiter.acquire(weight)
-                self._logger.info(
+                self._logger.debug(
                     "ccxt request: %s args=%s kwargs=%s",
                     request_name,
                     self._summarize_request(args),
                     self._summarize_request(kwargs),
                 )
                 result = func(*args, **kwargs)
-                self._logger.info(
+                self._logger.debug(
                     "ccxt response: %s summary=%s",
                     request_name,
                     self._summarize_response(result),
@@ -116,6 +138,9 @@ class ExchangeClient:
                     sleep_for,
                     exc.__class__.__name__,
                 )
+                # Re-sync clock on timestamp drift errors
+                if isinstance(exc, ccxt.InvalidNonce):
+                    self._sync_server_time()
                 time.sleep(sleep_for)
             except ccxt.PermissionDenied as exc:
                 raise RuntimeError("Permission denied") from exc

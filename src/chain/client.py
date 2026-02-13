@@ -148,7 +148,7 @@ class ChainClient:
                         timeout=self._timeout,
                     )
                     elapsed = time.perf_counter() - start
-                    logger.info("rpc %s %s in %.3fs", method, url, elapsed)
+                    logger.info("rpc %s in %.3fs", method, elapsed)
                     if response.status_code >= 400:
                         raise RPCError(f"HTTP {response.status_code} from {url}")
                     data = response.json()
@@ -181,7 +181,7 @@ class ChainClient:
                         timeout=self._timeout,
                     )
                     elapsed = time.perf_counter() - start
-                    logger.info("rpc batch %s in %.3fs", url, elapsed)
+                    logger.info("rpc batch (%d calls) in %.3fs", len(calls), elapsed)
                     if response.status_code >= 400:
                         raise RPCError(f"HTTP {response.status_code} from {url}")
                     data = response.json()

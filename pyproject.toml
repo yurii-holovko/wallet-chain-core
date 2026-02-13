@@ -9,6 +9,9 @@ line_length = 88
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests that hit real external services (deselect with '-m \"not integration\"')",
+]
 
 [tool.pyright]
 venvPath = "."

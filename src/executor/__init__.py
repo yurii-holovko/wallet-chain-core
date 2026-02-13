@@ -1,4 +1,6 @@
+from .alerts import Alert, AlertLevel, AlertType, WebhookAlerter, WebhookConfig
 from .engine import ExecutionContext, Executor, ExecutorConfig, ExecutorState
+from .metrics import MetricsRegistry, MetricsServer
 from .recovery import (
     BreakerState,
     CircuitBreaker,
@@ -25,4 +27,11 @@ __all__ = [
     "FailureCategory",
     "RecoveryManager",
     "RecoveryConfig",
+    "WebhookAlerter",
+    "WebhookConfig",
+    "Alert",
+    "AlertLevel",
+    "AlertType",
+    "MetricsRegistry",
+    "MetricsServer",
 ]

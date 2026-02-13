@@ -647,3 +647,327 @@ python -m src.integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-
 
 to be continued...
 </details>
+<details>
+<summary><span style="font-size:1.25em"><strong>Week 4: Strategy + Execution + Recovery</strong></span></summary>
+
+### Overview
+Week 4 turns the system into a production-style arbitrage loop:
+- strategy generates opportunities from CEX/DEX prices,
+- scorer ranks them by quality,
+- executor runs two-leg state-machine execution with retries/unwind,
+- recovery layer protects against duplicates, stale signals, and cascading failures.
+
+This week introduces the decision-and-control plane for reliable operation.
+
+### Architecture
+```
+SignalGenerator ──▶ SignalScorer ──▶ SignalPriorityQueue ──▶ Executor
+      │                    │                   │                 │
+      │                    │                   │                 ├─▶ RecoveryManager
+      │                    │                   │                 │    ├─ CircuitBreaker
+      │                    │                   │                 │    ├─ ReplayProtection
+      │                    │                   │                 │    └─ FailureClassifier
+      │                    │                   │                 │
+      └─ uses CEX+DEX prices ───────────────────────────────────┘
+```
+
+### Key Modules
+- `src/strategy/signal.py`
+  - `Signal` dataclass + `Direction` enum.
+  - Built-in validity checks (`expiry`, inventory/limits, expected net PnL, score).
+  - Unique `signal_id` and helper methods (`create`, `age_seconds`).
+
+- `src/strategy/fees.py`
+  - Fee model (`FeeStructure`) for CEX fee + DEX fee + slippage + gas.
+  - Computes `total_fee_bps`, breakeven spread, and expected net profit.
+
+- `src/strategy/generator.py`
+  - Fetches CEX order book and DEX quote (real pricer when configured, otherwise fallback simulation).
+  - Computes spread in both directions:
+    - BUY CEX / SELL DEX
+    - BUY DEX / SELL CEX
+  - Applies profitability gates (`min_spread_bps`, `min_profit_usd`), cooldown, inventory checks, and position limits.
+  - Emits a rich `Signal` with metadata (depth, breakeven bps, raw prices).
+
+- `src/strategy/scorer.py`
+  - Multi-factor scoring (0-100):
+    - spread (optionally net-of-fees),
+    - liquidity (top-of-book depth),
+    - inventory impact (rebalancing vs worsening skew),
+    - pair-specific history (EMA),
+    - urgency/freshness.
+  - Produces transparent score breakdown in `signal.meta["score_breakdown"]`.
+  - Supports score decay over time for queue prioritization.
+
+- `src/executor/engine.py`
+  - Strict state machine with guarded transitions:
+    - `IDLE -> VALIDATING -> LEG1_* -> LEG2_* -> DONE/FAILED/UNWINDING`
+  - Supports DEX-first (Flashbots style) and CEX-first sequencing.
+  - Retry with exponential backoff and per-leg timeout.
+  - Unwind flow if first leg fills and second leg fails.
+  - Tracks detailed execution metrics (latency, retries, slippage, fill ratio) and event audit trail.
+  - Computes realized PnL from actual fills and fee assumptions.
+
+- `src/executor/recovery.py`
+  - `FailureClassifier`: categorizes errors (TRANSIENT, PERMANENT, RATE_LIMIT, NETWORK, UNKNOWN).
+  - `CircuitBreaker`: global + per-pair breaker with failure-window and drawdown trip logic.
+  - `ReplayProtection`: dedup, staleness checks, nonce monotonicity, bounded memory (LRU), audit log.
+  - `RecoveryManager`: single pre-flight and post-outcome interface used by executor.
+
+- `scripts/arb_bot.py`
+  - Orchestrates end-to-end runtime loop:
+    - signal generation,
+    - scoring + queueing,
+    - execution,
+    - balance sync,
+    - metrics and webhook integration,
+    - recovery snapshots / breaker visibility.
+
+### Runtime Flow
+1. Load balances and market data.
+2. Generate candidate signals per pair.
+3. Score and filter by minimum score.
+4. Push to priority queue and drain highest-priority first.
+5. Execute via state machine (with retries and guarded transitions).
+6. On failure, trigger unwind if needed and record outcome in recovery.
+7. Update historical scorer outcomes and metrics.
+
+### Configuration Highlights
+- Strategy thresholds: `min_spread_bps`, `min_profit_usd`, `max_position_usd`, `signal_ttl_seconds`, `cooldown_seconds`.
+- Scorer threshold: `min_score` (typically 50-60).
+- Executor controls: `use_flashbots`, leg timeouts, retry counts, `simulation_mode`.
+- Recovery controls:
+  - breaker `failure_threshold`, `window_seconds`, `max_drawdown_usd`, `cooldown_seconds`,
+  - replay `ttl_seconds`, `max_age_seconds`, `nonce_check`.
+
+### Run
+Both modes live in a single script — `scripts/arb_bot.py`:
+
+```bash
+# Simulation — fake DEX prices, frequent trades, full pipeline
+python scripts/arb_bot.py --mode simulation
+
+# Paper — REAL CEX + DEX on-chain prices, simulated execution, PnL dashboard
+python scripts/arb_bot.py --mode paper
+```
+
+Default (no flag) is `simulation`.
+
+### Tests (Week 4)
+Main suites:
+- `tests/test_signal.py`
+- `tests/test_scorer.py`
+- `tests/test_executor.py`
+- `tests/test_recovery.py`
+
+Run just Week 4 tests:
+```bash
+pytest tests/test_signal.py tests/test_scorer.py tests/test_executor.py tests/test_recovery.py
+```
+
+Run all:
+```bash
+make test
+```
+
+### Definition of Done (Week 4)
+- [x] Signals include economics + validity gates
+- [x] Generator validates spread/profit/inventory/limits
+- [x] Scorer ranks opportunities with transparent breakdown
+- [x] Executor enforces strict transition-safe state machine
+- [x] Retry/backoff and unwind logic implemented
+- [x] Recovery layer protects against replay/stale/duplicate signals
+- [x] Circuit breaker trips on failures and drawdown
+- [x] Comprehensive unit tests for signal/scorer/executor/recovery
+
+### Stretch Goals
+- [x] Webhook alerts on circuit breaker trip
+- [x] Real DEX execution (not simulation)
+- [x] Multiple signals queued by priority
+- [x] Prometheus metrics export
+
+---
+
+### Stretch Goal 1 — Webhook Alerts on Circuit Breaker Trip ✅
+
+**Module:** `src/executor/alerts.py`
+
+**What's implemented:**
+- `WebhookAlerter` with background delivery thread — fire-and-forget, never blocks the hot path.
+- Alert types: `CIRCUIT_BREAKER_TRIP`, `CIRCUIT_BREAKER_HALF_OPEN`, `CIRCUIT_BREAKER_RESET`, `EXECUTION_FAILURE`, `DRAWDOWN`.
+- `WebhookConfig.from_env()` reads `WEBHOOK_URLS`, `WEBHOOK_TIMEOUT`, `WEBHOOK_MAX_RETRIES`, `WEBHOOK_COOLDOWN` from `.env`.
+- Per-alert-type + per-pair cooldown to avoid alert storms.
+- Exponential back-off retry on failed deliveries.
+- Bounded queue (500 max) — drops oldest if full.
+- `RecoveryManager.record_outcome()` automatically fires `on_circuit_breaker_trip()` when breaker transitions from CLOSED → OPEN.
+- `ArbBot._tick()` also fires `on_execution_failure()` on every failed execution.
+
+**Integration in `scripts/arb_bot.py`:**
+```python
+self.alerter = WebhookAlerter(WebhookConfig.from_env())
+self.alerter.start()
+self.executor.recovery.alerter = self.alerter  # auto-fires on CB trip
+```
+
+**How to test:**
+```bash
+pytest tests/test_alerts.py -v
+```
+Tests cover: payload structure, env config parsing, disabled alerter, cooldown throttling, real HTTP delivery to a local test server, retry on 500, all-retries-fail tracking, convenience senders (`on_circuit_breaker_trip`, `on_circuit_breaker_half_open`, `on_circuit_breaker_reset`, `on_execution_failure`, `on_drawdown`), and stats structure.
+
+**Manual smoke test:**
+1. Set `WEBHOOK_URLS=https://your-endpoint.com/hook` in `.env`.
+2. Run the bot and force repeated failures (e.g. misconfigure DEX config so every execution fails).
+3. After `failure_threshold` failures within the window, the circuit breaker trips → webhook fires with a JSON payload containing `type`, `level`, `pair`, `message`, `details`, `timestamp`.
+
+---
+
+### Stretch Goal 2 — Real DEX Execution (Not Simulation) ✅
+
+**Module:** `src/executor/engine.py` → `_execute_real_dex_leg()`
+
+**What's implemented:**
+- When `ExecutorConfig.simulation_mode = False`, the executor calls `_execute_real_dex_leg()` instead of returning a simulated fill.
+- Builds and signs real Uniswap V2 swap transactions via `TransactionBuilder`:
+  - `BUY_CEX_SELL_DEX` → `swapExactETHForTokens` (sell ETH for quote token on DEX).
+  - `BUY_DEX_SELL_CEX` → `swapExactTokensForETH` (sell quote token for ETH on DEX).
+- Configurable slippage (`dex_slippage_bps`), deadline (`dex_deadline_seconds`), gas priority (`dex_gas_priority`), and chain ID (`dex_chain_id`).
+- Uses `ChainClient` for RPC and `WalletManager` for key management — initialized lazily via `_ensure_dex_ready()`.
+- Returns real tx hash from on-chain receipt.
+- Simulation path returns `0xsim_...` hashes; real path returns actual `0x...` hashes.
+
+**Branching logic:**
+```python
+async def _execute_dex_leg(self, signal, size):
+    if self.config.simulation_mode:
+        return {"success": True, "price": ..., "tx_hash": "0xsim_..."}
+    return await asyncio.to_thread(self._execute_real_dex_leg, signal, size)
+```
+
+**How to test:**
+```bash
+pytest tests/test_executor.py -v
+```
+The executor test suite covers the full state machine (IDLE → VALIDATING → LEG1 → LEG2 → DONE/FAILED/UNWINDING) in simulation mode. Real DEX execution is integration-level and requires a testnet setup.
+
+**Manual smoke test (Sepolia testnet):**
+1. Set in `.env`:
+   ```
+   SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+   PRIVATE_KEY=0x...
+   DEX_ROUTER_ADDRESS=0x...   # Uniswap V2 Router on Sepolia
+   DEX_WETH_ADDRESS=0x...
+   DEX_QUOTE_TOKEN_ADDRESS=0x...
+   ```
+2. Run `scripts/arb_bot.py` with `simulation=False` in config.
+3. Confirm execution context has a real tx hash format (`0x...64hex`) instead of `0xsim_...`.
+4. Verify transaction on Sepolia Etherscan.
+
+---
+
+### Stretch Goal 3 — Multiple Signals Queued by Priority ✅
+
+**Module:** `src/strategy/priority_queue.py`
+
+**What's implemented:**
+- `SignalPriorityQueue` backed by a min-heap (negated scores for max-priority-first ordering).
+- Configurable via `PriorityQueueConfig`:
+  - `max_depth` (default 50) — evicts lowest-scoring signals when over capacity.
+  - `max_per_pair` (default 1) — prevents executing 2 signals for the same pair in one tick.
+  - `score_decay` — re-applies decay function before yielding (stale signals lose priority).
+  - `min_score` — drops signals that fall below threshold after decay.
+- Deduplication by `signal_id` — rejects duplicate pushes.
+- `drain()` yields signals in descending score order with expiry checks.
+- Stats tracking: `total_pushed`, `total_dropped`, `total_yielded`, `queued`.
+
+**Integration in `scripts/arb_bot.py`:**
+```python
+# Phase 1: Collect signals into priority queue
+self.priority_queue.clear()
+for pair in self.pairs:
+    signal = self.generator.generate(pair, self.trade_size)
+    signal.score = self.scorer.score(signal, skews)
+    self.priority_queue.push(signal)
+
+# Phase 2: Execute signals in priority order
+for signal in self.priority_queue.drain():
+    ctx = await self.executor.execute(signal)
+```
+
+**How to test:**
+```bash
+pytest tests/test_priority_queue.py -v
+```
+Tests cover: push/drain ordering, deduplication, max-depth eviction with stats, per-pair concurrency limits, signal expiry, score decay application, decay-below-min-score drop, peek without removal, clear, and stats accumulation.
+
+**Manual smoke test:**
+1. Configure multiple pairs (e.g. `ETH/USDT`, `BTC/USDT`, `ARB/USDT`) in bot config.
+2. Lower `min_score` to ~30 so multiple signals are accepted.
+3. Run bot and observe logs — higher-score signals are executed first within each tick.
+4. Confirm `arb_queue_depth` gauge in `/metrics` reflects queue size before draining.
+
+---
+
+### Stretch Goal 4 — Prometheus Metrics Export ✅
+
+**Module:** `src/executor/metrics.py`
+
+**What's implemented:**
+- Custom Prometheus-compatible metrics (no `prometheus_client` dependency):
+  - **Counter**: `arb_signals_total{pair,direction}`, `arb_executions_total{pair,state}`, `arb_unwinds_total{pair,success}`, `arb_circuit_breaker_trips_total{pair}`, `arb_webhook_sent_total`.
+  - **Gauge**: `arb_spread_bps{pair}`, `arb_score{pair}`, `arb_pnl_total_usd`, `arb_inventory_skew_pct{pair,venue}`, `arb_circuit_breaker_state{pair}` (0=closed, 1=open, 2=half_open), `arb_queue_depth`.
+  - **Histogram**: `arb_execution_latency_ms{pair,leg}` with configurable buckets.
+- `MetricsRegistry` collects all metrics and emits Prometheus text exposition format.
+- `MetricsServer` runs a background HTTP server (default port 9090):
+  - `GET /metrics` — full Prometheus scrape endpoint.
+  - `GET /health` — health check (`{"status":"ok"}`).
+- Thread-safe counters and gauges (tested with concurrent writes).
+
+**Integration in `scripts/arb_bot.py`:**
+```python
+self.metrics = MetricsRegistry()
+self.metrics_server = MetricsServer(self.metrics, port=metrics_port)
+self.metrics_server.start()
+
+# In _tick():
+self.metrics.signals_total.inc(pair=pair, direction=signal.direction.name)
+self.metrics.spread_bps.set(signal.spread_bps, pair=pair)
+self.metrics.pnl_total.inc(ctx.actual_net_pnl or 0)
+self.metrics.queue_depth.set(self.priority_queue.size)
+self.metrics.cb_state.set(cb_val, pair=pair)
+```
+
+**How to test:**
+```bash
+pytest tests/test_metrics.py -v
+```
+Tests cover: counter inc (with/without labels), gauge set/inc/overwrite, histogram observe with buckets and labels, HELP/TYPE header lines, registry `collect_all()` output, real HTTP `/metrics` endpoint, `/health` endpoint, 404 on unknown paths, server start/stop lifecycle, and concurrent thread-safety for counters and gauges.
+
+**Manual smoke test:**
+1. Start the bot (default `METRICS_PORT=9090`).
+2. Open `http://localhost:9090/metrics` in a browser or `curl`.
+3. Verify Prometheus text format with key series:
+   ```
+   # HELP arb_signals_total Total arbitrage signals generated
+   # TYPE arb_signals_total counter
+   arb_signals_total{pair="ETH/USDT",direction="BUY_CEX_SELL_DEX"} 5.0
+
+   # HELP arb_pnl_total_usd Cumulative PnL in USD
+   # TYPE arb_pnl_total_usd gauge
+   arb_pnl_total_usd 12.5
+   ```
+4. Add to `prometheus.yml`:
+   ```yaml
+   scrape_configs:
+     - job_name: 'arb-bot'
+       static_configs:
+         - targets: ['localhost:9090']
+   ```
+
+---
+
+### Run All Stretch Goal Tests
+```bash
+pytest tests/test_alerts.py tests/test_priority_queue.py tests/test_metrics.py tests/test_executor.py -v
+```
+</details>

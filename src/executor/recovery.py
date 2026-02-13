@@ -530,11 +530,12 @@ class RecoveryManager:
     and failure classifier.
     """
 
-    def __init__(self, config: RecoveryConfig = None):
+    def __init__(self, config: RecoveryConfig = None, alerter=None):
         cfg = config or RecoveryConfig()
         self.circuit_breaker = CircuitBreaker(cfg.circuit_breaker)
         self.replay = ReplayProtection(cfg.replay)
         self.classifier = FailureClassifier()
+        self.alerter = alerter  # Optional WebhookAlerter
         self._outcomes: list[dict] = []
 
     # ── pre-flight gate ───────────────────────────────────────
@@ -575,11 +576,20 @@ class RecoveryManager:
         """Record the result of an execution attempt."""
         self.replay.mark_executed(signal)
 
+        # Capture breaker state *before* recording
+        was_open = self.circuit_breaker.is_open(signal.pair)
+
         if success:
             self.circuit_breaker.record_success(signal.pair, pnl)
         else:
             category = self.classifier.classify(error)
             self.circuit_breaker.record_failure(signal.pair, category, pnl)
+
+        # Fire webhook if breaker just tripped
+        is_open_now = self.circuit_breaker.is_open(signal.pair)
+        if not was_open and is_open_now and self.alerter:
+            snap = self.circuit_breaker.snapshot(signal.pair)
+            self.alerter.on_circuit_breaker_trip(signal.pair, snap)
 
         self._outcomes.append(
             {

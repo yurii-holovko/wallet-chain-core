@@ -1,7 +1,31 @@
+"""
+Arbitrage Bot — two modes in one script.
+
+Modes:
+  simulation  — simulated DEX prices (CEX mid × markup), frequent trades,
+                full pipeline (scoring, inventory, circuit breaker, recovery).
+                For testing bot logic.
+
+  paper       — REAL CEX + DEX on-chain prices, simulated execution,
+                live PnL dashboard with trade log.
+                For monitoring real market conditions.
+
+Usage:
+  python scripts/arb_bot.py                  # default: simulation
+  python scripts/arb_bot.py --mode simulation
+  python scripts/arb_bot.py --mode paper
+"""
+
+# flake8: noqa
+
+import argparse
 import asyncio
 import logging
 import os
 import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -12,17 +36,63 @@ from chain import ChainClient  # noqa: E402
 from core.base_types import Address, TokenAmount, TransactionRequest  # noqa: E402
 from core.wallet_manager import WalletManager  # noqa: E402
 from exchange.client import ExchangeClient  # noqa: E402
+from executor.alerts import WebhookAlerter, WebhookConfig  # noqa: E402
 from executor.engine import Executor, ExecutorConfig, ExecutorState  # noqa: E402
+from executor.metrics import MetricsRegistry, MetricsServer  # noqa: E402
 from executor.recovery import RecoveryConfig  # noqa: E402
 from inventory.tracker import InventoryTracker, Venue  # noqa: E402
+from pricing.dex_pricer import DexPricer  # noqa: E402
 from strategy.fees import FeeStructure  # noqa: E402
 from strategy.generator import SignalGenerator  # noqa: E402
-from strategy.scorer import SignalScorer  # noqa: E402
+from strategy.priority_queue import (  # noqa: E402
+    PriorityQueueConfig,
+    SignalPriorityQueue,
+)
+from strategy.scorer import ScorerConfig, SignalScorer  # noqa: E402
+from strategy.signal import Direction  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+# ── Paper-trade record ────────────────────────────────────────────
+
+
+@dataclass
+class PaperTrade:
+    """One simulated trade with full details."""
+
+    timestamp: float
+    pair: str
+    direction: Direction
+    size: float
+    cex_price: float
+    dex_price: float
+    spread_bps: float
+    gross_pnl: float
+    fees_usd: float
+    net_pnl: float
+    cumulative_pnl: float = 0.0
+
+    @property
+    def time_str(self) -> str:
+        dt = datetime.fromtimestamp(self.timestamp, tz=timezone.utc)
+        return dt.strftime("%H:%M:%S")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ArbBot — full simulation pipeline
+# ══════════════════════════════════════════════════════════════════
 
 
 class ArbBot:
+    """
+    Full arbitrage bot with scoring, inventory, circuit breaker,
+    recovery, webhooks, Prometheus metrics, and priority queue.
+
+    DEX prices are simulated from CEX mid × markup → frequent trades.
+    """
+
     def __init__(self, config: dict):
-        # Initialize all modules from Weeks 1-4
         self.exchange = ExchangeClient(
             {
                 "apiKey": config["binance_key"],
@@ -31,18 +101,17 @@ class ArbBot:
             }
         )
         self.inventory = InventoryTracker([Venue.BINANCE, Venue.WALLET])
-        self.fees = FeeStructure()
-        self.generator = SignalGenerator(
-            self.exchange,
-            None,
-            self.inventory,
-            self.fees,
-            config.get("signal_config", {}),
+        self.fees = FeeStructure(
+            gas_cost_usd=config.get("gas_cost_usd", 0.50),
         )
-        self.scorer = SignalScorer()
-        simulation_mode = config.get("simulation", False)
+
+        simulation_mode = config.get("simulation", True)
+        self.simulation_mode = simulation_mode
+        self.sim_wallet_eth = config.get("sim_wallet_eth", 1.0)
+        self.sim_wallet_usdt = config.get("sim_wallet_usdt", 5000.0)
         self.wallet: WalletManager | None = None
         self.chain_client: ChainClient | None = None
+        self.dex_pricer: DexPricer | None = None
         self.dex_quote_token = config.get("dex_quote_token_address") or os.getenv(
             "DEX_QUOTE_TOKEN_ADDRESS"
         )
@@ -51,15 +120,71 @@ class ArbBot:
         )
         self.dex_chain_id = int(config.get("dex_chain_id", 11155111))
 
+        # ── Chain client (read-only for DEX pricing) ──────────
+        # Explicit None in config means "no DEX pricing" — skip fallbacks.
+        if "dex_pricing_rpc_url" in config and config["dex_pricing_rpc_url"] is None:
+            pricing_rpc = None
+        else:
+            pricing_rpc = (
+                config.get("dex_pricing_rpc_url")
+                or os.getenv("DEX_PRICING_RPC_URL")
+                or config.get("dex_rpc_url")
+                or os.getenv("ETH_RPC_URL")
+            )
+        rpc_url = config.get("dex_rpc_url") or os.getenv("SEPOLIA_RPC_URL")
+        pool_address = config.get("dex_pool_address") or os.getenv("DEX_POOL_ADDRESS")
+        weth_address = config.get("dex_weth_address") or os.getenv("DEX_WETH_ADDRESS")
+
+        if pricing_rpc and pool_address and weth_address:
+            pricing_client = ChainClient([pricing_rpc])
+            self.dex_pricer = DexPricer(
+                pricing_client,
+                pool_address,
+                weth_address,
+            )
+            logging.info(
+                "DEX pricer: real on-chain prices from pool %s",
+                pool_address,
+            )
+        else:
+            logging.warning(
+                "DEX pricer: simulated prices (set DEX_POOL_ADDRESS + "
+                "DEX_WETH_ADDRESS + ETH_RPC_URL for real quotes)"
+            )
+
+        # ── Wallet (only needed for real execution) ───────────
         if not simulation_mode:
-            rpc_url = config.get("dex_rpc_url") or os.getenv("SEPOLIA_RPC_URL")
             if not rpc_url:
                 raise ValueError("SEPOLIA_RPC_URL is required when simulation=False")
             private_key = config.get("dex_private_key") or os.getenv("PRIVATE_KEY")
             if not private_key:
                 raise ValueError("PRIVATE_KEY is required when simulation=False")
             self.wallet = WalletManager(private_key)
-            self.chain_client = ChainClient([rpc_url])
+            if self.chain_client is None:
+                self.chain_client = ChainClient([rpc_url])
+
+        self.generator = SignalGenerator(
+            self.exchange,
+            self.dex_pricer,  # None → simulated prices, DexPricer → real on-chain
+            self.inventory,
+            self.fees,
+            config.get("signal_config", {}),
+        )
+        scorer_cfg = ScorerConfig(
+            min_score=config.get("min_score", 55.0),
+        )
+        self.scorer = SignalScorer(scorer_cfg)
+
+        # ── Stretch Goal 1: Webhook Alerts ────────────────────
+        webhook_cfg = WebhookConfig.from_env()
+        self.alerter = WebhookAlerter(webhook_cfg)
+
+        # ── Stretch Goal 4: Prometheus Metrics ────────────────
+        self.metrics = MetricsRegistry()
+        metrics_port = int(
+            config.get("metrics_port", os.getenv("METRICS_PORT", "9090"))
+        )
+        self.metrics_server = MetricsServer(self.metrics, port=metrics_port)
 
         self.executor = Executor(
             self.exchange,
@@ -76,6 +201,18 @@ class ArbBot:
             ),
             recovery_config=RecoveryConfig(),
         )
+        self.executor.recovery.alerter = self.alerter
+
+        # ── Stretch Goal 3: Priority Queue ────────────────────
+        pq_cfg = PriorityQueueConfig(
+            max_depth=int(config.get("pq_max_depth", 50)),
+            max_per_pair=int(config.get("pq_max_per_pair", 1)),
+            min_score=self.scorer.config.min_score,
+        )
+        self.priority_queue = SignalPriorityQueue(
+            config=pq_cfg,
+            decay_fn=self.scorer.apply_decay,
+        )
 
         self.pairs = config.get("pairs", ["ETH/USDT"])
         self.trade_size = config.get("trade_size", 0.1)
@@ -83,7 +220,19 @@ class ArbBot:
 
     async def run(self):
         self.running = True
-        logging.info("Bot starting...")
+        exec_mode = "SIMULATION" if self.simulation_mode else "LIVE"
+        price_mode = "REAL on-chain" if self.dex_pricer else "SIMULATED"
+        logging.info("Bot starting... [exec=%s, dex_prices=%s]", exec_mode, price_mode)
+        if self.simulation_mode:
+            logging.info(
+                "Simulated wallet: %.2f ETH / %.0f USDT",
+                self.sim_wallet_eth,
+                self.sim_wallet_usdt,
+            )
+
+        self.alerter.start()
+        self.metrics_server.start()
+
         await self._sync_balances()
 
         while self.running:
@@ -102,8 +251,10 @@ class ArbBot:
             logging.info("Circuit breaker open — reset in %.0fs", reset_in)
             return
 
+        # ── Phase 1: Collect signals into priority queue ──────
+        self.priority_queue.clear()
+
         for pair in self.pairs:
-            # Per-pair circuit breaker check
             if self.executor.circuit_breaker.is_open(pair):
                 logging.info("CB open for %s — skipping", pair)
                 continue
@@ -112,47 +263,113 @@ class ArbBot:
             if signal is None:
                 continue
 
-            # Score signal with real inventory skew data
             skews = self._get_inventory_skews(pair)
             signal.score = self.scorer.score(signal, skews)
 
-            if signal.score < self.scorer.config.min_score:
-                continue
+            self.metrics.signals_total.inc(pair=pair, direction=signal.direction.name)
+            self.metrics.spread_bps.set(signal.spread_bps, pair=pair)
+            self.metrics.score.set(signal.score, pair=pair)
 
+            dex_src = "on-chain" if self.dex_pricer else "sim"
             logging.info(
-                f"Signal: {pair} spread={signal.spread_bps:.1f}bps score={signal.score}"
+                "Signal: %s spread=%.1fbps score=%d  " "CEX=%.2f  DEX=%.2f [%s]",
+                pair,
+                signal.spread_bps,
+                int(round(signal.score)),
+                signal.cex_price,
+                signal.dex_price,
+                dex_src,
             )
 
-            # Execute (pre-flight + replay handled inside executor)
+            if signal.score < self.scorer.config.min_score:
+                logging.info(
+                    "Skipped: score below threshold (%.1f < %.1f)",
+                    signal.score,
+                    self.scorer.config.min_score,
+                )
+                continue
+
+            self.priority_queue.push(signal)
+
+        self.metrics.queue_depth.set(self.priority_queue.size)
+
+        # ── Phase 2: Execute signals in priority order ────────
+        for signal in self.priority_queue.drain():
+            pair = signal.pair
+
+            logging.info(
+                "Executing: %s %.4g %s",
+                signal.direction.name,
+                signal.size,
+                self._base_asset(pair),
+            )
+
             ctx = await self.executor.execute(signal)
 
-            # Record result for scorer history
+            self.metrics.executions_total.inc(pair=pair, state=ctx.state.name)
+            if ctx.metrics.leg1_latency_ms:
+                self.metrics.execution_latency.observe(
+                    ctx.metrics.leg1_latency_ms, pair=pair, leg="leg1"
+                )
+            if ctx.metrics.leg2_latency_ms:
+                self.metrics.execution_latency.observe(
+                    ctx.metrics.leg2_latency_ms, pair=pair, leg="leg2"
+                )
+            if ctx.metrics.unwind_attempted:
+                self.metrics.unwinds_total.inc(
+                    pair=pair,
+                    success=str(ctx.metrics.unwind_success or False),
+                )
+
             success = ctx.state == ExecutorState.DONE
             self.scorer.record_result(pair, success)
 
             if success:
-                logging.info(
-                    "SUCCESS %s  PnL=$%.4f  duration=%.0fms  retries=%d/%d",
-                    pair,
-                    ctx.actual_net_pnl or 0,
-                    ctx.duration_ms or 0,
-                    ctx.metrics.leg1_retries,
-                    ctx.metrics.leg2_retries,
-                )
+                logging.info("SUCCESS: PnL=$%.4f", ctx.actual_net_pnl or 0)
+                self.metrics.pnl_total.inc(ctx.actual_net_pnl or 0)
             else:
+                unwind_note = " - unwound" if ctx.metrics.unwind_success else ""
                 logging.warning(
-                    "FAILED %s  error=%s  unwind=%s  cb=%s",
-                    pair,
-                    ctx.error,
-                    ctx.metrics.unwind_success,
-                    recovery.snapshot(pair)["circuit_breaker"],
+                    "FAILED: %s%s", ctx.error or "execution failed", unwind_note
                 )
+                self._log_circuit_breaker_status(pair, recovery.snapshot(pair))
+
+                self.alerter.on_execution_failure(
+                    pair, ctx.error or "unknown", bool(ctx.metrics.unwind_success)
+                )
+
+            cb_val = 0
+            if self.executor.circuit_breaker.is_open(pair):
+                cb_val = 1
+            self.metrics.cb_state.set(cb_val, pair=pair)
 
             await self._sync_balances()
 
     async def _sync_balances(self):
+        if self.simulation_mode:
+            # In simulation mode, use fake balances — no API keys needed
+            sim_cex = {
+                "ETH": {
+                    "free": str(self.sim_wallet_eth),
+                    "locked": "0",
+                    "total": str(self.sim_wallet_eth),
+                },
+                "USDT": {
+                    "free": str(self.sim_wallet_usdt),
+                    "locked": "0",
+                    "total": str(self.sim_wallet_usdt),
+                },
+            }
+            self.inventory.update_from_cex(Venue.BINANCE, sim_cex)
+            self.inventory.update_from_wallet(
+                Venue.WALLET,
+                {"ETH": str(self.sim_wallet_eth), "USDT": str(self.sim_wallet_usdt)},
+            )
+            return
+
         balances = self.exchange.fetch_balance()
         self.inventory.update_from_cex(Venue.BINANCE, balances)
+
         if self.chain_client is None or self.wallet is None:
             return
 
@@ -166,11 +383,25 @@ class ArbBot:
             )
         self.inventory.update_from_wallet(Venue.WALLET, wallet_balances)
 
+        for pair in self.pairs:
+            base = self._base_asset(pair)
+            try:
+                skew = self.inventory.skew(base)
+                for venue_name, venue_data in skew.get("venues", {}).items():
+                    self.metrics.inventory_skew.set(
+                        venue_data.get("deviation_pct", 0.0),
+                        pair=pair,
+                        venue=venue_name,
+                    )
+            except Exception:
+                pass
+
     def stop(self):
         self.running = False
+        self.alerter.stop()
+        self.metrics_server.stop()
 
     def _get_inventory_skews(self, pair: str) -> list[dict]:
-        """Build skew dicts for the base and quote assets of *pair*."""
         try:
             base, quote = pair.split("/")
             return [
@@ -197,20 +428,408 @@ class ArbBot:
         human = Decimal(amount_raw) / Decimal(10**decimals)
         return str(human)
 
+    @staticmethod
+    def _base_asset(pair: str) -> str:
+        return pair.split("/")[0] if "/" in pair else pair
 
-# Entry point
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    config = {
+    def _log_circuit_breaker_status(self, pair: str, snapshot: dict) -> None:
+        cb = snapshot.get("circuit_breaker", {})
+        pair_snap = cb.get("pair")
+        global_snap = cb.get("global", {})
+
+        active = pair_snap if pair_snap else global_snap
+        failures = int(active.get("failures", 0))
+        threshold = int(self.executor.circuit_breaker.config.failure_threshold)
+        logging.warning(
+            "Circuit breaker: %d/%d failures (%s)", failures, threshold, pair
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PaperBot — real prices, simulated execution, PnL dashboard
+# ══════════════════════════════════════════════════════════════════
+
+
+class PaperBot:
+    """
+    Fetch REAL prices from CEX (Binance) + DEX (Uniswap V2 on-chain),
+    simulate trades, track PnL with a live dashboard.
+
+    No real orders are placed.  No wallet or private key needed.
+    """
+
+    def __init__(self, config: dict):
+        # ── CEX client (for order book) ───────────────────────
+        self.exchange = ExchangeClient(
+            {
+                "apiKey": config["binance_key"],
+                "secret": config["binance_secret"],
+                "sandbox": config.get("binance_sandbox", True),
+            }
+        )
+
+        # ── DEX pricer (on-chain reads, no gas) ───────────────
+        pricing_rpc = (
+            config.get("dex_pricing_rpc_url")
+            or os.getenv("DEX_PRICING_RPC_URL")
+            or os.getenv("ETH_RPC_URL")
+        )
+        pool_address = config.get("dex_pool_address") or os.getenv(
+            "DEX_POOL_ADDRESS",
+            "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",  # WETH/USDT V2
+        )
+        weth_address = config.get("dex_weth_address") or os.getenv(
+            "DEX_WETH_ADDRESS",
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # Mainnet WETH
+        )
+
+        if not pricing_rpc:
+            raise ValueError(
+                "ETH_RPC_URL is required for paper mode (real DEX prices). "
+                "Set it to an Ethereum mainnet RPC (e.g. Infura/Alchemy)."
+            )
+
+        chain_client = ChainClient([pricing_rpc])
+        self.dex_pricer = DexPricer(chain_client, pool_address, weth_address)
+
+        # ── Fee model ─────────────────────────────────────────
+        self.fees = FeeStructure(
+            gas_cost_usd=config.get("gas_cost_usd", 0.50),
+            cex_taker_bps=config.get("cex_taker_bps", 10.0),
+            dex_swap_bps=config.get("dex_swap_bps", 30.0),
+            slippage_bps=config.get("slippage_bps", 5.0),
+        )
+
+        # ── Strategy config ───────────────────────────────────
+        self.pairs = config.get("pairs", ["ETH/USDT"])
+        self.trade_size = config.get("trade_size", 0.05)
+        self.min_spread_bps = config.get("min_spread_bps", 10)
+        self.min_profit_usd = config.get("min_profit_usd", 0.01)
+        self.tick_interval = config.get("tick_interval", 5.0)
+
+        # ── Paper trading state ───────────────────────────────
+        self.trades: list[PaperTrade] = []
+        self.cumulative_pnl: float = 0.0
+        self.total_ticks: int = 0
+        self.start_time: float = 0.0
+        self.running = False
+
+    # ── Main loop ─────────────────────────────────────────────
+
+    async def run(self):
+        self.running = True
+        self.start_time = time.time()
+
+        self._print_header()
+
+        while self.running:
+            try:
+                await self._tick()
+                await asyncio.sleep(self.tick_interval)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error("Tick error: %s", e)
+                await asyncio.sleep(5)
+
+        self._print_summary()
+
+    async def _tick(self):
+        self.total_ticks += 1
+
+        for pair in self.pairs:
+            # ── 1. Fetch real CEX prices ──────────────────────
+            try:
+                ob = self.exchange.fetch_order_book(pair)
+            except Exception as exc:
+                logger.warning("CEX fetch failed: %s", exc)
+                continue
+
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
+            if not bids or not asks:
+                continue
+
+            cex_bid = float(bids[0][0])
+            cex_ask = float(asks[0][0])
+            cex_mid = (cex_bid + cex_ask) / 2
+
+            # ── 2. Fetch real DEX prices ──────────────────────
+            dex_quote = self.dex_pricer.get_quote(pair, self.trade_size)
+            if dex_quote is None:
+                logger.warning("DEX quote failed for %s", pair)
+                continue
+
+            dex_buy = dex_quote["buy"]
+            dex_sell = dex_quote["sell"]
+
+            # ── 3. Compute spreads in both directions ─────────
+            spread_a = (dex_sell - cex_ask) / cex_ask * 10_000
+            spread_b = (cex_bid - dex_buy) / dex_buy * 10_000
+
+            if spread_a >= spread_b:
+                direction = Direction.BUY_CEX_SELL_DEX
+                spread = spread_a
+                cex_price = cex_ask
+                dex_price = dex_sell
+            else:
+                direction = Direction.BUY_DEX_SELL_CEX
+                spread = spread_b
+                cex_price = cex_bid
+                dex_price = dex_buy
+
+            # ── 4. Economics ──────────────────────────────────
+            trade_value = self.trade_size * cex_mid
+            gross_pnl = (spread / 10_000) * trade_value
+            total_fee_bps = self.fees.total_fee_bps(trade_value)
+            fees_usd = (total_fee_bps / 10_000) * trade_value
+            net_pnl = gross_pnl - fees_usd
+
+            # ── 5. Print live prices ──────────────────────────
+            now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            spread_icon = "🟢" if spread >= self.min_spread_bps else "⚪"
+
+            print(
+                f"  {now_str}  {pair}  "
+                f"CEX bid={cex_bid:>10.2f}  ask={cex_ask:>10.2f}  │  "
+                f"DEX buy={dex_buy:>10.2f}  sell={dex_sell:>10.2f}  │  "
+                f"{spread_icon} spread={spread:>+7.1f}bps  "
+                f"net=${net_pnl:>+.4f}  "
+                f"fees={total_fee_bps:.0f}bps",
+            )
+
+            # ── 6. Simulate trade if profitable ──────────────
+            if spread < self.min_spread_bps:
+                continue
+            if net_pnl < self.min_profit_usd:
+                continue
+
+            self.cumulative_pnl += net_pnl
+            trade = PaperTrade(
+                timestamp=time.time(),
+                pair=pair,
+                direction=direction,
+                size=self.trade_size,
+                cex_price=cex_price,
+                dex_price=dex_price,
+                spread_bps=round(spread, 1),
+                gross_pnl=round(gross_pnl, 4),
+                fees_usd=round(fees_usd, 4),
+                net_pnl=round(net_pnl, 4),
+                cumulative_pnl=round(self.cumulative_pnl, 4),
+            )
+            self.trades.append(trade)
+
+            dir_label = (
+                "CEX→DEX" if direction == Direction.BUY_CEX_SELL_DEX else "DEX→CEX"
+            )
+            pnl_icon = "✅" if net_pnl > 0 else "❌"
+            print(
+                f"  {pnl_icon} PAPER TRADE #{len(self.trades):>3}  "
+                f"{dir_label}  {self.trade_size} {pair.split('/')[0]}  "
+                f"spread={spread:+.1f}bps  "
+                f"gross=${gross_pnl:+.4f}  fees=${fees_usd:.4f}  "
+                f"net=${net_pnl:+.4f}  "
+                f"cumPnL=${self.cumulative_pnl:+.4f}"
+            )
+
+    # ── Display helpers ───────────────────────────────────────
+
+    def _print_header(self):
+        print("\n" + "=" * 100)
+        print("  📄 PAPER MODE — Real Prices, Simulated Execution")
+        print("=" * 100)
+        print(f"  Pairs:      {', '.join(self.pairs)}")
+        print(f"  Trade size: {self.trade_size}")
+        print(f"  Min spread: {self.min_spread_bps} bps")
+        print(f"  Min profit: ${self.min_profit_usd}")
+        print(
+            f"  Fees model: CEX={self.fees.cex_taker_bps}bps  "
+            f"DEX={self.fees.dex_swap_bps}bps  "
+            f"gas=${self.fees.gas_cost_usd}  "
+            f"slippage={self.fees.slippage_bps}bps"
+        )
+        print(f"  Tick:       every {self.tick_interval}s")
+        print("-" * 100)
+        print("  Press Ctrl+C to stop and see summary\n")
+
+    def _print_summary(self):
+        elapsed = time.time() - self.start_time
+        elapsed_min = elapsed / 60
+
+        print("\n" + "=" * 100)
+        print("  📊 PAPER TRADING SUMMARY")
+        print("=" * 100)
+        print(f"  Duration:       {elapsed_min:.1f} minutes ({self.total_ticks} ticks)")
+        print(f"  Total trades:   {len(self.trades)}")
+
+        if not self.trades:
+            print("  No trades executed.")
+            print("=" * 100)
+            return
+
+        wins = [t for t in self.trades if t.net_pnl > 0]
+        losses = [t for t in self.trades if t.net_pnl <= 0]
+        win_rate = len(wins) / len(self.trades) * 100
+
+        total_gross = sum(t.gross_pnl for t in self.trades)
+        total_fees = sum(t.fees_usd for t in self.trades)
+        total_net = sum(t.net_pnl for t in self.trades)
+        avg_spread = sum(t.spread_bps for t in self.trades) / len(self.trades)
+        best_trade = max(self.trades, key=lambda t: t.net_pnl)
+        worst_trade = min(self.trades, key=lambda t: t.net_pnl)
+
+        print(f"  Win rate:       {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)")
+        print(f"  Gross PnL:      ${total_gross:+.4f}")
+        print(f"  Total fees:     ${total_fees:.4f}")
+        print(f"  Net PnL:        ${total_net:+.4f}")
+        print(f"  Avg spread:     {avg_spread:.1f} bps")
+        print(
+            f"  Best trade:     ${best_trade.net_pnl:+.4f} ({best_trade.spread_bps}bps)"
+        )
+        print(
+            f"  Worst trade:    ${worst_trade.net_pnl:+.4f} ({worst_trade.spread_bps}bps)"
+        )
+
+        if elapsed_min > 0:
+            trades_per_hour = len(self.trades) / (elapsed_min / 60)
+            pnl_per_hour = total_net / (elapsed_min / 60)
+            print(f"  Trades/hour:    {trades_per_hour:.1f}")
+            print(f"  PnL/hour:       ${pnl_per_hour:+.4f}")
+
+        # ── Last 10 trades table ──────────────────────────────
+        print("\n  Last 10 trades:")
+        print(
+            f"  {'#':>4}  {'Time':>8}  {'Dir':>7}  {'Size':>6}  "
+            f"{'CEX':>10}  {'DEX':>10}  {'Spread':>8}  "
+            f"{'Net PnL':>9}  {'CumPnL':>9}"
+        )
+        print("  " + "-" * 90)
+
+        for i, t in enumerate(self.trades[-10:], start=max(1, len(self.trades) - 9)):
+            dir_label = (
+                "CEX→DEX" if t.direction == Direction.BUY_CEX_SELL_DEX else "DEX→CEX"
+            )
+            print(
+                f"  {i:>4}  {t.time_str:>8}  {dir_label:>7}  {t.size:>6.3f}  "
+                f"{t.cex_price:>10.2f}  {t.dex_price:>10.2f}  "
+                f"{t.spread_bps:>+7.1f}  "
+                f"${t.net_pnl:>+8.4f}  ${t.cumulative_pnl:>+8.4f}"
+            )
+
+        print("=" * 100 + "\n")
+
+    def stop(self):
+        self.running = False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Entry point
+# ══════════════════════════════════════════════════════════════════
+
+
+def _build_simulation_config() -> dict:
+    """Config for simulation mode (fake DEX prices, frequent trades)."""
+    return {
         "binance_key": os.getenv("BINANCE_TESTNET_API_KEY"),
         "binance_secret": os.getenv("BINANCE_TESTNET_SECRET"),
         "pairs": ["ETH/USDT"],
-        "trade_size": 0.1,
-        "simulation": False,
+        "trade_size": 0.05,
+        "simulation": True,
+        "sim_wallet_eth": 1.0,
+        "sim_wallet_usdt": 5000.0,
+        "gas_cost_usd": 0.10,
+        "min_score": 30.0,
+        "signal_config": {
+            "min_profit_usd": 0.10,
+            "min_spread_bps": 30,
+        },
+        # Simulation uses fake DEX prices — no RPC needed
+        "dex_pricing_rpc_url": None,
         "dex_rpc_url": os.getenv("SEPOLIA_RPC_URL"),
+        "dex_pool_address": os.getenv(
+            "DEX_POOL_ADDRESS",
+            "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",
+        ),
+        "dex_weth_address": os.getenv(
+            "DEX_WETH_ADDRESS",
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        ),
         "dex_router_address": os.getenv("DEX_ROUTER_ADDRESS"),
-        "dex_weth_address": os.getenv("DEX_WETH_ADDRESS"),
         "dex_quote_token_address": os.getenv("DEX_QUOTE_TOKEN_ADDRESS"),
     }
-    bot = ArbBot(config)
-    asyncio.run(bot.run())
+
+
+def _build_paper_config() -> dict:
+    """Config for paper mode (real CEX + DEX prices, simulated execution)."""
+    return {
+        "binance_key": os.getenv("BINANCE_TESTNET_API_KEY"),
+        "binance_secret": os.getenv("BINANCE_TESTNET_SECRET"),
+        "binance_sandbox": True,
+        # Real on-chain DEX prices (eth_call is free)
+        "dex_pricing_rpc_url": os.getenv("ETH_RPC_URL"),
+        "dex_pool_address": os.getenv(
+            "DEX_POOL_ADDRESS",
+            "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",
+        ),
+        "dex_weth_address": os.getenv(
+            "DEX_WETH_ADDRESS",
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        ),
+        # Strategy
+        "pairs": ["ETH/USDT"],
+        "trade_size": 0.05,
+        "min_spread_bps": 10,
+        "min_profit_usd": 0.01,
+        "tick_interval": 5.0,
+        # Fee model
+        "gas_cost_usd": 0.50,
+        "cex_taker_bps": 10.0,
+        "dex_swap_bps": 30.0,
+        "slippage_bps": 5.0,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="CEX↔DEX Arbitrage Bot",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["simulation", "paper"],
+        default="simulation",
+        help=(
+            "simulation — fake DEX prices, frequent trades, full pipeline\n"
+            "             (scoring, inventory, circuit breaker, recovery)\n"
+            "paper      — REAL CEX + DEX prices, simulated execution,\n"
+            "             live PnL dashboard with trade log"
+        ),
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Suppress noisy third-party logs
+    logging.getLogger("ccxt").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    if args.mode == "simulation":
+        config = _build_simulation_config()
+        bot = ArbBot(config)
+        try:
+            asyncio.run(bot.run())
+        except KeyboardInterrupt:
+            bot.stop()
+
+    elif args.mode == "paper":
+        config = _build_paper_config()
+        bot = PaperBot(config)
+        try:
+            asyncio.run(bot.run())
+        except KeyboardInterrupt:
+            bot.stop()
+            bot._print_summary()

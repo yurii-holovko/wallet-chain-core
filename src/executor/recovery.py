@@ -550,12 +550,12 @@ class RecoveryManager:
         """
         # 1. Circuit breaker
         if not self.circuit_breaker.allows_trade(signal.pair):
+            # Note: when the global breaker is HALF_OPEN, ``allows_trade()`` already
+            # returns True (the single probe is allowed through there). Reaching
+            # this branch therefore implies the breaker is fully OPEN globally or
+            # for this pair.
             reason = "circuit breaker open"
-            if self.circuit_breaker._global.state == BreakerState.HALF_OPEN:
-                reason = "circuit breaker half-open (probe)"
-                # allow the probe through
-            else:
-                return False, reason
+            return False, reason
 
         # 2. Replay protection
         allowed, reason = self.replay.check(signal)

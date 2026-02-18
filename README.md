@@ -971,3 +971,410 @@ Tests cover: counter inc (with/without labels), gauge set/inc/overwrite, histogr
 pytest tests/test_alerts.py tests/test_priority_queue.py tests/test_metrics.py tests/test_executor.py -v
 ```
 </details>
+<details>
+<summary><span style="font-size:1.25em"><strong>Week 5: Dry Run &amp; Micro-Arb Bot</strong></span></summary>
+
+### Overview
+
+Week 5 is about running the **full arbitrage stack in dry-run mode** with:
+
+- a focused **Arbitrum ⇄ MEXC micro-arbitrage loop** (`DoubleLimitArbitrageEngine`),
+- strict **safety limits** and **kill switch**,
+- **structured logging**, **webhook alerts**, and an optional **Telegram bot**,
+- and a repeatable **pre‑flight token verification** flow.
+
+The goal is to behave like a production bot while **never placing real orders** yet.
+
+---
+
+### High-Level Architecture (Implemented)
+
+#### Layer 1 — Infrastructure
+
+Conceptually:
+
+```
+┌─────────────────────────────────────────┐
+│  Arbitrum RPC (Alchemy or similar)     │
+│  • Used by ChainClient + Uniswap V3    │
+│  • Low-latency HTTPS RPC               │
+└─────────────────┬──────────────────────┘
+                  │
+┌─────────────────▼──────────────────────┐
+│  Wallet + Key Management               │
+│  • WalletManager (signing, address)    │
+│  • Capital limited to test size        │
+└────────────────────────────────────────┘
+```
+
+In code:
+
+- `ChainClient` (`src/chain/client.py`) uses `ARBITRUM_RPC_HTTPS`/`ARBITRUM_RPC_WSS` from `.env`.
+- `WalletManager` (`src/core/wallet_manager.py`) holds the Arbitrum key when you enable on-chain V3 range orders.
+- For micro-arb dry run, **no real on-chain trades are sent**; the engine uses ODOS quotes and MEXC order books only.
+
+#### Layer 2 — Monitoring & Detection
+
+Instead of external price feeds, Week 5 uses **direct venue data**:
+
+```
+┌─────────────────────────────────────────┐
+│  MEXC REST API (spot)                  │
+│  • get_order_book() top-of-book L2     │
+│  • 0% maker-fee limit orders           │
+└─────────────────┬──────────────────────┘
+                  │
+┌─────────────────▼──────────────────────┐
+│  ODOS Aggregator (pricing.odos_client) │
+│  • USDC → token quotes on Arbitrum     │
+│  • Realistic DEX execution prices      │
+└────────────────────────────────────────┘
+```
+
+In code:
+
+- `scripts/demo_double_limit.py`:
+  - pulls MEXC order books via `MexcClient.get_order_book()` (`src/exchange/mexc_client.py`),
+  - pulls DEX quotes via `OdosClient.quote()` (`src/pricing/odos_client.py`),
+  - loops every few seconds and logs spreads + **net** PnL for a curated token universe from `config_tokens_arb_mex.py`.
+
+#### Layer 3 — Execution Engine (Double Limit)
+
+Core micro-arb logic lives in `src/executor/double_limit_engine.py`:
+
+```
+┌─────────────────────────────────────────┐
+│  DoubleLimitArbitrageEngine            │
+│  • Evaluates CEX vs ODOS prices        │
+│  • Models LP fee + gas + bridge costs  │
+│  • Chooses direction (mex→arb / arb→mex)│
+└─────────────────┬──────────────────────┘
+                  │
+        (Week 5: evaluation only)
+```
+
+- `evaluate_opportunity()`:
+  - reads top-of-book from MEXC,
+  - gets a $5 USDC → token ODOS quote,
+  - computes:
+    - gross spread,
+    - LP fee (0.3% tier) + gas + amortized bridge cost via `CapitalManager`,
+    - **net_profit_usd** and **net_profit_pct**,
+    - whether the opportunity is `executable` under configured thresholds.
+- In Week‑5 **dry run**, `demo_double_limit` only calls `evaluate_opportunity` and logs:
+  - `spread=…% net=$… (%) EXECUTABLE/SKIP` — **no orders are sent**.
+
+The full `execute_double_limit()` path exists (post-only MEXC + optional Uniswap V3 range orders via `UniswapV3RangeOrderManager`) but is not used in the dry-run script.
+
+#### Layer 4 — Capital Management
+
+Capital and bridging policy are encapsulated in `src/core/capital_manager.py`:
+
+```
+┌─────────────────────────────────────────┐
+│  CapitalManager                         │
+│  • Tracks trade_count_since_bridge      │
+│  • Amortizes bridge cost over trades    │
+│  • Decides when to bridge ≥ $20 profit  │
+└─────────────────────────────────────────┘
+```
+
+- `CapitalManagerConfig` sets:
+  - `starting_cex_usd`, `starting_chain_usd`,
+  - `bridge_threshold_usd` (e.g. $20),
+  - `bridge_fixed_cost_usd` (e.g. $0.05 — actual MEXC withdrawal fee for USDT on Arbitrum One).
+- The Double Limit engine pulls an **amortized bridge cost per trade** from `get_effective_bridge_cost()`, so micro trades are only considered if they can dilute fixed costs.
+- **Cost verification**: Run `python scripts/verify_all_costs.py` to verify gas costs, bridge fees, and LP fees match actual market conditions.
+
+---
+
+### Safety, Dry Run & Kill Switch
+
+#### Absolute Safety Constants
+
+`src/safety.py` defines **hard-coded, non-configurable** limits:
+
+```python
+ABSOLUTE_MAX_TRADE_USD = 25.0
+ABSOLUTE_MAX_DAILY_LOSS = 20.0
+ABSOLUTE_MIN_CAPITAL = 50.0
+ABSOLUTE_MAX_TRADES_PER_HOUR = 30
+```
+
+and a final gate:
+
+```python
+def safety_check(trade_usd, daily_loss, total_capital, trades_this_hour) -> tuple[bool, str]:
+    ...
+```
+
+`scripts/arb_bot.py` calls `safety_check(...)` **after all other checks** (spread, inventory, circuit breaker, etc.). If any limit is breached, the trade is blocked and an alert is sent.
+
+#### Dry-Run Mode
+
+`ArbBot` supports a strict dry-run flag:
+
+```python
+self.dry_run = config.get("dry_run", True)
+...
+if self.dry_run:
+    logging.info(
+        "DRY RUN | Would trade: %s %s size=%.4f spread=%.1fbps expected_pnl=$%.2f",
+        pair,
+        signal.direction.value,
+        signal.size,
+        signal.spread_bps,
+        signal.expected_net_pnl,
+    )
+    return  # no Executor.execute()
+```
+
+For Week 5, you typically:
+
+- use `--mode double_limit` (observation-only micro-arb),
+- or `--mode simulation`/`paper` with `dry_run=True` to exercise the full state machine without real orders.
+
+#### Kill Switch (File + Telegram)
+
+Kill switch is a **shared file** in your OS temp directory:
+
+```python
+from pathlib import Path
+import tempfile
+
+KILL_SWITCH_FILE = str(Path(tempfile.gettempdir()) / "arb_bot_kill")
+```
+
+All main loops (`ArbBot.run`, `demo_double_limit.main`) do:
+
+```python
+if is_kill_switch_active():
+    # pause: no new trades, but process + Telegram bot stay alive
+```
+
+The **Telegram bot** (`src/telegram_bot.py`) gives you remote control:
+
+- `/kill` → creates `arb_bot_kill` → bots pause.
+- `/resume` → deletes `arb_bot_kill` → bots resume.
+- `/status` → replies with current kill-switch status.
+
+Environment variables:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:ABC...   # from BotFather
+TELEGRAM_CHAT_ID=617012126        # your chat ID
+TELEGRAM_POLL_SEC=1.0             # optional, default 2.0
+```
+
+The entrypoint (`scripts/arb_bot.py`) starts a shared `TelegramBot` for all modes and stops it on shutdown.
+
+---
+
+### Monitoring & Alerts
+
+**Structured logging** (files + stdout):
+
+- `scripts/arb_bot.py` → `logs/bot_YYYYMMDD.log`
+- `scripts/demo_double_limit.py` → `logs/double_limit_YYYYMMDD.log`
+
+```python
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s |%(levelname)s |%(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(),
+    ],
+)
+```
+
+**Webhook alerts** (`src/executor/alerts.py`) are already integrated:
+
+- Circuit breaker trips / resets.
+- Execution failures + unwind status.
+- Drawdown alerts.
+
+`ArbBot` also sends custom alerts for:
+
+- Bot start (`mode`, `dry_run`),
+- Kill switch activated / cleared,
+- Trade completed with realized net PnL,
+- Absolute safety limit violations (e.g. daily loss).
+
+To wire alerts to Slack/Telegram/etc., point `WEBHOOK_URLS` to your bridge endpoint in `.env`.
+
+---
+
+### How to Run Week 5 Dry Run
+
+#### 1. Configure `.env`
+
+Minimum required for Double Limit dry run:
+
+```env
+# Arbitrum + ODOS + MEXC
+ALCHEMY_API_KEY=...
+ARBITRUM_RPC_HTTPS=https://arb-mainnet.g.alchemy.com/v2/...
+ARBITRUM_WALLET_ADDRESS=0x...
+USDC_ADDRESS=0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+
+MEXC_API_KEY=...
+MEXC_API_SECRET=...
+MEXC_BASE_URL=https://api.mexc.com
+
+# ODOS has no API key, just base URL in OdosClient
+
+# Double Limit parameters
+TRADE_SIZE_USD=5.0
+MIN_SPREAD_PCT=0.0075
+MIN_PROFIT_USD=0.001
+MAX_SLIPPAGE_PCT=0.5
+
+# Optional: Telegram control
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=617012126
+```
+
+#### 2. Verify costs and token universe
+
+**Cost verification** (recommended first):
+
+```bash
+python scripts/verify_all_costs.py
+```
+
+This verifies:
+- Gas costs on Arbitrum (compares configured vs. actual),
+- Bridge fees from MEXC (fetches actual withdrawal fees),
+- LP fees by token (from configuration),
+- Total cost estimation per trade.
+
+**Token verification**:
+
+```bash
+python scripts/verify_tokens.py
+```
+
+This prints a **TOKEN VERIFICATION REPORT** and a JSON **CONFIG PATCH FOR FAILED TOKENS**. Week 5 already applied the patch for known failures (AAVE, CVX, FXS, YFI, LDO, etc.).
+
+**Note**: Ensure your MEXC API key has:
+- Correct `MEXC_API_KEY` and `MEXC_API_SECRET` in `.env` (whitespace is automatically stripped),
+- "Withdrawal" permission enabled (not just "View deposit/withdrawal details"),
+- IP address matches bound IP (if IP binding is enabled).
+
+#### 3. Start Double Limit dry run
+
+Use the unified entrypoint:
+
+```bash
+# Default trade size ($5.0 from TRADE_SIZE_USD env var or config)
+python scripts/arb_bot.py --mode double_limit
+
+# Custom trade size ($10.0)
+python scripts/arb_bot.py --mode double_limit --trade-size 10.0
+
+# Or use $5.0 explicitly
+python scripts/arb_bot.py --mode double_limit --trade-size 5.0
+```
+
+**Trade size options**:
+- `--trade-size 5.0` — $5 USD per trade (default, good for micro-arb testing)
+- `--trade-size 10.0` — $10 USD per trade (larger positions, higher capital requirements)
+
+If `--trade-size` is not specified, the bot uses `TRADE_SIZE_USD` from `.env` or defaults to `5.0`.
+
+What this does:
+
+- Starts structured logging and metrics.
+- Starts the Telegram bot (if configured).
+- Delegates to `scripts/demo_double_limit.py`:
+  - Calls `DoubleLimitArbitrageEngine.evaluate_opportunity()` for each token.
+  - Logs:
+    - MEXC bid/ask,
+    - ODOS price,
+    - gross spread,
+    - **net** profit after fees + gas + bridge amortization,
+    - whether the opportunity is `EXECUTABLE` under your thresholds.
+- **No real orders** are sent in this mode.
+
+Let this run for **≥30 minutes** and keep `logs/double_limit_YYYYMMDD.log` as your Week‑5 dry‑run artifact.
+
+#### 3b. Real trade (both legs)
+
+To place **real** orders (MEXC limit order + Uniswap V3 range order on Arbitrum), follow these steps:
+
+1. **Environment**
+   - Ensure `.env` has: `MEXC_API_KEY`, `MEXC_API_SECRET`, `ARBITRUM_RPC_HTTPS`, `PRIVATE_KEY`, `USDC_ADDRESS`, `ARBITRUM_WALLET_ADDRESS`, `UNISWAP_V3_POSITION_MANAGER`.
+   - Optional: `ENABLE_LIVE_EXECUTION=1` (or use `--execute` when running the bot).
+
+2. **Balances**
+   - **MEXC**: Enough USDT (or base for the pair) and the token you trade (e.g. ARB) so a post-only limit order can be placed for `TRADE_SIZE_USD`.
+   - **Arbitrum**: Enough USDC in `ARBITRUM_WALLET_ADDRESS` for the V3 leg (~`TRADE_SIZE_USD`), plus some ETH for gas.
+
+3. **Approvals**
+   - The Uniswap V3 range manager will use the Nonfungible Position Manager; the first time you run, it will request token approvals (USDC and the quote token) for that contract. Ensure the wallet can sign those transactions (or run once on testnet to approve).
+
+4. **Cost verification (recommended)**
+   ```bash
+   python scripts/verify_all_costs.py
+   python scripts/verify_tokens.py
+   ```
+
+5. **Run with live execution**
+   ```bash
+   # Option A: CLI flag
+   python scripts/arb_bot.py --mode double_limit --execute --trade-size 5.0
+
+   # Option B: env var (same as --execute)
+   set ENABLE_LIVE_EXECUTION=1
+   python scripts/arb_bot.py --mode double_limit --trade-size 5.0
+   ```
+   When an **EXECUTABLE** opportunity appears, the bot will place both legs (MEXC limit + V3 range), monitor until both fill or timeout (~10 min), then cancel any unfilled leg. Logs go to `logs/double_limit_YYYYMMDD.log`.
+
+6. **Safety**
+   - Use small `TRADE_SIZE_USD` (e.g. 5.0) for the first real run.
+   - Kill switch: if `KILL_SWITCH_PATH` exists and is non-empty, the bot will not execute (see safety module).
+
+#### 4. Optional: CEX/DEX arb bot dry run
+
+To exercise the Week‑4 CEX/DEX engine with all safety gates:
+
+```bash
+python scripts/arb_bot.py --mode simulation    # or --mode paper
+```
+
+With `dry_run=True` (default), you’ll see:
+
+```text
+DRY RUN | Would trade: ETH/USDT buy_cex_sell_dex size=... spread=...bps expected_pnl=$...
+```
+
+covering:
+
+- signal generation,
+- scoring + priority queue,
+- executor state machine and recovery (simulated),
+- safety_check(),
+- circuit breaker + webhook/Telegram alerts.
+
+---
+
+### Conceptual vs. Internship Baseline
+
+Compared to a “basic” internship-style arb loop (single Uniswap V2 swap + MEXC/Binance market order with taker fees and public RPC), the Week‑5 framework pushes toward a **professional micro‑arbitrage architecture**:
+
+- **Zero taker fees** on the CEX path (post‑only MEXC limit orders when real execution is enabled).
+- **Aggregator-based DEX pricing** via ODOS instead of raw pool math.
+- **Amortized fixed costs** via `CapitalManager` and bridge thresholding (bridge fee: $0.05 USDT per withdrawal, amortized over 5+ trades).
+- **Strict safety limits** and kill switch, integrated at the execution boundary.
+- **Observability**: structured logs, metrics, webhooks, and Telegram control.
+- **Cost verification**: Automated scripts verify gas costs, bridge fees, and LP fees match actual market conditions.
+
+**Recent updates**:
+- Fixed MEXC API signature generation (handles GET requests correctly, strips whitespace from API keys).
+- Updated bridge cost model: `bridge_fixed_cost_usd` set to $0.05 (actual MEXC withdrawal fee) instead of $0.32.
+- Improved network matching: bridge verification now handles MEXC network names with parentheses (e.g., "Arbitrum One(ARB)").
+
+The current codebase implements the **core building blocks** for this architecture in dry‑run / observation mode, so you can validate economics and safety before ever placing a real trade.
+
+</details>

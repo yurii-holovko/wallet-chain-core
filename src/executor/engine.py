@@ -6,7 +6,7 @@ Lifecycle of an execution::
     IDLE ─► VALIDATING ─► LEG1_PENDING ─► LEG1_CONFIRMING ─► LEG1_FILLED
                                                                    │
                                                                    ▼
-         DONE ◄── LEG2_FILLED ◄── LEG2_CONFIRMING ◄── LEG2_PENDING
+              DONE ◄── LEG2_FILLED ◄── LEG2_CONFIRMING ◄── LEG2_PENDING
                                          │
                                          ▼
                                      UNWINDING ─► FAILED

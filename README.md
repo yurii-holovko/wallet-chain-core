@@ -1502,7 +1502,8 @@ The codebase supports **full production trading** with `--execute` flag: real ME
 
 ---
 
-## Conclusion
+<details>
+<summary><span style="font-size:1.25em"><strong>Conclusion</strong></span></summary>
 
 After five weeks of development, this project has evolved from basic wallet management to a production-ready micro-arbitrage trading system. The journey covered secure key management, on-chain transaction building, AMM pricing and routing, CEX integration, strategy execution, and finally a focused Arbitrum ⇄ MEXC micro-arbitrage engine with parallel route monitoring.
 
@@ -1530,3 +1531,5 @@ Through building this system, several key insights emerged:
 - **Incremental Development**: Building week-by-week (wallet → chain → pricing → exchange → execution → production) allowed each layer to be tested independently before integration. This modular approach made debugging much easier.
 
 The codebase now supports full production trading with real orders, but the safety mechanisms, dry-run modes, and comprehensive logging ensure that every execution is monitored, every failure is analyzed, and every improvement is data-driven.
+
+</details>

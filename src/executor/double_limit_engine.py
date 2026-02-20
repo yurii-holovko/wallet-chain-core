@@ -79,7 +79,7 @@ class DoubleLimitConfig:
     arb_gas_price_gwei: float = 0.1
     # ETH price in USD — used to convert gas units to USD.
     # Override via ETH_PRICE_USD env var or update at startup.
-    eth_price_usd: float = 2600.0
+    eth_price_usd: float = 1900.0
     # ODOS "surplus" fee is small but non-zero (0.01% = 1 bp)
     odos_fee_pct: float = 0.0001
     # MEXC fee model: maker=0% (post-only), taker=0.1%

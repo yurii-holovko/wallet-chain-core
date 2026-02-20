@@ -1033,12 +1033,12 @@ Instead of external price feeds, Week 5 uses **direct venue data**:
 
 In code:
 
-- `scripts/demo_double_limit.py` (MEXC + V3 arb, formerly “Double Limit”):
+- `scripts/demo_double_limit.py` (MEXC + ODOS arb):
   - pulls MEXC order books via `MexcClient.get_order_book()` (`src/exchange/mexc_client.py`),
   - pulls DEX quotes via `OdosClient.quote()` (`src/pricing/odos_client.py`),
   - loops every few seconds and logs spreads + **net** PnL for a curated token universe from `config_tokens_arb_mex.py`.
 
-#### Layer 3 — Execution Engine (MEXC + V3 Arb)
+#### Layer 3 — Execution Engine (MEXC + ODOS Arb)
 
 Core micro-arb logic lives in `src/executor/double_limit_engine.py`:
 
@@ -1048,23 +1048,26 @@ Core micro-arb logic lives in `src/executor/double_limit_engine.py`:
 │  • Evaluates CEX vs ODOS prices        │
 │  • Models LP fee + gas + bridge costs  │
 │  • Chooses direction (mex→arb / arb→mex)│
+│  • RouteHealthTracker: gas-based route │
+│    reliability (V3 direct vs ODOS)    │
 └─────────────────┬──────────────────────┘
                   │
-        (Week 5: evaluation only)
+        (Week 5: evaluation only by default)
 ```
 
 - `evaluate_opportunity()`:
   - reads top-of-book from MEXC,
-  - gets a $5 USDC → token ODOS quote,
+  - gets ODOS quotes (USDC ↔ token) for both directions,
   - computes:
     - gross spread,
-    - LP fee (0.3% tier) + gas + amortized bridge cost via `CapitalManager`,
+    - LP fee by tier (0.05% / 0.3% / 1%) + gas + amortized bridge cost via `CapitalManager`,
     - **net_profit_usd** and **net_profit_pct**,
-    - whether the opportunity is `executable` under configured thresholds.
-- In Week‑5 **dry run**, `demo_double_limit` only calls `evaluate_opportunity` and logs:
+    - whether the opportunity is `executable` under per-tier thresholds (`min_spread_by_tier`: 0.45% / 0.65% / 1.2%).
+- `RouteHealthTracker` records gas usage per token/route; unreliable ODOS routes (avg gas > threshold) are penalized in favor of V3 direct.
+- In Week‑5 **dry run** (default), `demo_double_limit` only calls `evaluate_opportunity` and logs:
   - `spread=…% net=$… (%) EXECUTABLE/SKIP` — **no orders are sent**.
 
-The full `execute_double_limit()` path exists (post-only MEXC + optional Uniswap V3 range orders via `UniswapV3RangeOrderManager`) but is not used in the dry-run script.
+The full `execute_double_limit()` path exists: **post-only MEXC limit** + **ODOS swap** via `DexSwapManager` (quote → assemble → approve → send). V3 direct swaps are used when the engine determines they are more reliable than ODOS for a given token.
 
 #### Layer 4 — Capital Management
 
@@ -1131,7 +1134,7 @@ if self.dry_run:
 
 For Week 5, you typically:
 
-- use `--mode mexc_v3` (observation-only MEXC + V3 arb; `double_limit` remains as a deprecated alias),
+- use `--mode mexc_v3` (observation-only MEXC + ODOS arb; `double_limit` is a deprecated alias),
 - or `--mode simulation`/`paper` with `dry_run=True` to exercise the full state machine without real orders.
 
 #### Kill Switch (File + Telegram)
@@ -1209,7 +1212,7 @@ To wire alerts to Slack/Telegram/etc., point `WEBHOOK_URLS` to your bridge endpo
 
 #### 1. Configure `.env`
 
-Minimum required for MEXC + V3 dry run:
+Minimum required for MEXC + ODOS dry run:
 
 ```env
 # Arbitrum + ODOS + MEXC
@@ -1224,9 +1227,9 @@ MEXC_BASE_URL=https://api.mexc.com
 
 # ODOS has no API key, just base URL in OdosClient
 
-# MEXC + V3 arb parameters (formerly “Double Limit”)
+# MEXC + ODOS arb parameters
 TRADE_SIZE_USD=5.0
-MIN_SPREAD_PCT=0.0075
+MIN_SPREAD_PCT=0.004
 MIN_PROFIT_USD=0.001
 MAX_SLIPPAGE_PCT=0.5
 
@@ -1262,7 +1265,7 @@ This prints a **TOKEN VERIFICATION REPORT** and a JSON **CONFIG PATCH FOR FAILED
 - "Withdrawal" permission enabled (not just "View deposit/withdrawal details"),
 - IP address matches bound IP (if IP binding is enabled).
 
-#### 3. Start MEXC + V3 dry run
+#### 3. Start MEXC + ODOS dry run
 
 Use the unified entrypoint:
 
@@ -1273,21 +1276,20 @@ python scripts/arb_bot.py --mode mexc_v3
 # Custom trade size ($10.0)
 python scripts/arb_bot.py --mode mexc_v3 --trade-size 10.0
 
-# Or use $5.0 explicitly
-python scripts/arb_bot.py --mode mexc_v3 --trade-size 5.0
+# Limit to specific tokens
+python scripts/arb_bot.py --mode mexc_v3 --tokens ARB,GMX,LINK
 ```
 
-**Trade size options**:
-- `--trade-size 5.0` — $5 USD per trade (default, good for micro-arb testing)
-- `--trade-size 10.0` — $10 USD per trade (larger positions, higher capital requirements)
-
-If `--trade-size` is not specified, the bot uses `TRADE_SIZE_USD` from `.env` or defaults to `5.0`.
+**CLI options**:
+- `--trade-size 5.0` — $5 USD per trade (default; good for micro-arb testing)
+- `--tokens ARB,GMX,LINK` — comma-separated symbols to track (default: all active tokens)
+- `--max-trades N` — stop after N successful trades (e.g. 1 for a single transaction)
 
 What this does:
 
 - Starts structured logging and metrics.
 - Starts the Telegram bot (if configured).
-- Delegates to `scripts/demo_double_limit.py` (MEXC + V3 arb, formerly “Double Limit”):
+- Delegates to `scripts/demo_double_limit.py` (MEXC + ODOS arb):
   - Calls `DoubleLimitArbitrageEngine.evaluate_opportunity()` for each token.
   - Logs:
     - MEXC bid/ask,
@@ -1299,20 +1301,28 @@ What this does:
 
 Let this run for **≥30 minutes** and keep `logs/double_limit_YYYYMMDD.log` as your Week‑5 dry‑run artifact.
 
+**Simulate execution** (two legs, no real orders):
+
+```bash
+python scripts/arb_bot.py --mode mexc_v3 --simulate-execution --trade-size 5.0
+```
+
+This exercises the full `execute_double_limit()` flow with simulated fills/timeouts (controlled by `DOUBLE_LIMIT_SIM_SCENARIO=success|timeout|mex_reject|dex_failed`).
+
 #### 3b. Real trade (both legs)
 
-To place **real** orders (MEXC limit order + Uniswap V3 range order on Arbitrum), follow these steps:
+To place **real** orders (MEXC limit + ODOS swap on Arbitrum), follow these steps:
 
 1. **Environment**
-   - Ensure `.env` has: `MEXC_API_KEY`, `MEXC_API_SECRET`, `ARBITRUM_RPC_HTTPS`, `PRIVATE_KEY`, `USDC_ADDRESS`, `ARBITRUM_WALLET_ADDRESS`, `UNISWAP_V3_POSITION_MANAGER`.
-   - Optional: `ENABLE_LIVE_EXECUTION=1` (or use `--execute` when running the bot).
+   - Ensure `.env` has: `MEXC_API_KEY`, `MEXC_API_SECRET`, `ARBITRUM_RPC_HTTPS`, `PRIVATE_KEY`, `USDC_ADDRESS`, `ARBITRUM_WALLET_ADDRESS`.
+   - Use `--execute` when running the bot (or `ENABLE_LIVE_EXECUTION=1` in `.env`).
 
 2. **Balances**
-   - **MEXC**: Enough USDT (or base for the pair) and the token you trade (e.g. ARB) so a post-only limit order can be placed for `TRADE_SIZE_USD`.
-   - **Arbitrum**: Enough USDC in `ARBITRUM_WALLET_ADDRESS` for the V3 leg (~`TRADE_SIZE_USD`), plus some ETH for gas.
+   - **MEXC**: Enough USDT and the token you trade (e.g. ARB) so a post-only limit order can be placed for `TRADE_SIZE_USD`.
+   - **Arbitrum**: Enough USDC in `ARBITRUM_WALLET_ADDRESS` for the DEX leg (~`TRADE_SIZE_USD`), plus some ETH for gas.
 
 3. **Approvals**
-   - The Uniswap V3 range manager will use the Nonfungible Position Manager; the first time you run, it will request token approvals (USDC and the quote token) for that contract. Ensure the wallet can sign those transactions (or run once on testnet to approve).
+   - The first ODOS swap will request token approvals (USDC and the quote token) for the swap router. Ensure the wallet can sign those transactions.
 
 4. **Cost verification (recommended)**
    ```bash
@@ -1322,18 +1332,18 @@ To place **real** orders (MEXC limit order + Uniswap V3 range order on Arbitrum)
 
 5. **Run with live execution**
    ```bash
-   # Option A: CLI flag
-   python scripts/arb_bot.py --mode double_limit --execute --trade-size 5.0
+   # CLI flag (preferred)
+   python scripts/arb_bot.py --mode mexc_v3 --execute --trade-size 5.0
 
-   # Option B: env var (same as --execute)
+   # Or env var
    set ENABLE_LIVE_EXECUTION=1
-   python scripts/arb_bot.py --mode double_limit --trade-size 5.0
+   python scripts/arb_bot.py --mode mexc_v3 --trade-size 5.0
    ```
-   When an **EXECUTABLE** opportunity appears, the bot will place both legs (MEXC limit + V3 range), monitor until both fill or timeout (~10 min), then cancel any unfilled leg. Logs go to `logs/double_limit_YYYYMMDD.log`.
+   When an **EXECUTABLE** opportunity appears, the bot will place both legs (MEXC limit + ODOS swap), monitor until both fill or timeout (~10 min), then unwind if needed. Logs go to `logs/double_limit_YYYYMMDD.log`.
 
 6. **Safety**
    - Use small `TRADE_SIZE_USD` (e.g. 5.0) for the first real run.
-   - Kill switch: if `KILL_SWITCH_PATH` exists and is non-empty, the bot will not execute (see safety module).
+   - Kill switch: `arb_bot_kill` file in temp dir (or `/kill` via Telegram) pauses new trades.
 
 #### 4. Optional: CEX/DEX arb bot dry run
 
@@ -1371,9 +1381,12 @@ Compared to a “basic” internship-style arb loop (single Uniswap V2 swap + ME
 - **Cost verification**: Automated scripts verify gas costs, bridge fees, and LP fees match actual market conditions.
 
 **Recent updates**:
-- Fixed MEXC API signature generation (handles GET requests correctly, strips whitespace from API keys).
-- Updated bridge cost model: `bridge_fixed_cost_usd` set to $0.05 (actual MEXC withdrawal fee) instead of $0.32.
-- Improved network matching: bridge verification now handles MEXC network names with parentheses (e.g., "Arbitrum One(ARB)").
+- DEX leg uses **ODOS swap** via `DexSwapManager` (quote → assemble → approve → send); V3 direct swaps used when route health favors them.
+- `RouteHealthTracker` records gas per token/route; unreliable ODOS routes (avg gas > threshold) are penalized.
+- Per-tier min spread: 0.45% (500), 0.65% (3000), 1.2% (10000) for $5–10 micro-arb.
+- `--simulate-execution` flag exercises full two-leg flow without real orders (`DOUBLE_LIMIT_SIM_SCENARIO`).
+- `--tokens` and `--max-trades` CLI options for focused runs.
+- Fixed MEXC API signature generation; bridge cost $0.05 (MEXC withdrawal fee); network matching for "Arbitrum One(ARB)".
 
 The current codebase implements the **core building blocks** for this architecture in dry‑run / observation mode, so you can validate economics and safety before ever placing a real trade.
 

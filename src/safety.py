@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Tuple
 
 # safety.py — DO NOT MODIFY THESE VALUES
+#
+# Justification (for ~$100 starting capital):
+#   MAX_TRADE  $25  → single trade ≤ 25% of capital; limits per-trade blow-up
+#   DAILY_LOSS $20  → max 20% drawdown per day; preserves ability to trade tomorrow
+#   MIN_CAPITAL $50 → halt at 50% of starting capital; prevents ruin
+#   TRADES/HR   30  → ~1 every 2 min; prevents runaway hot loop
 
 ABSOLUTE_MAX_TRADE_USD = 25.0  # Hard ceiling on any single trade
 ABSOLUTE_MAX_DAILY_LOSS = 20.0  # Hard ceiling on daily loss

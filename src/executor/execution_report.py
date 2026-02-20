@@ -109,7 +109,9 @@ def format_double_limit_report(
     opp: Any,
 ) -> str:
     """
-    Full execution report for Double Limit: opportunity + CEX + DEX (V3) + outcome.
+    Full execution report for Double Limit: opportunity + CEX + DEX + outcome.
+
+    Supports both legacy V3 range-order results and new ODOS swap results.
     opp = DoubleLimitOpportunity; result = return value of execute_double_limit().
     """
     status = result.get("status", "UNKNOWN")
@@ -149,30 +151,54 @@ def format_double_limit_report(
     else:
         lines.append("  (no order)")
     lines.append("")
-    lines.append("DEX (V3 range):")
-    v3 = result.get("v3_status") or {}
-    v3_pos_id = result.get("v3_position_id")
-    swap_done = bool(v3.get("is_executed"))
-    leg_dex = LegSummary(
-        venue="dex",
-        order_id_or_tx=f"position#{v3_pos_id}" if v3_pos_id is not None else None,
-        status=(
-            "EXECUTED" if swap_done else ("PENDING" if v3_pos_id is not None else "—")
-        ),
-        filled=None,
-        price=None,
-        swap_executed=swap_done if v3 else None,
-        extra=dict(v3) if v3 else {},
-    )
-    lines.append(leg_dex.to_line())
-    if v3:
-        lines.append(
-            f"  liquidity={v3.get('liquidity')}  in_range={v3.get('in_range')}"
+
+    # DEX leg: new ODOS swap path or legacy V3 range order
+    dex_tx_hash = result.get("dex_tx_hash")
+    dex_ok = result.get("dex_success", False)
+
+    if dex_tx_hash is not None or "dex_success" in result:
+        lines.append("DEX (ODOS swap):")
+        dex_swap_res = result.get("dex_swap_result")
+        gas_used = getattr(dex_swap_res, "gas_used", None) if dex_swap_res else None
+        leg_dex = LegSummary(
+            venue="dex",
+            order_id_or_tx=dex_tx_hash,
+            status="FILLED" if dex_ok else "FAILED",
+            swap_executed=dex_ok,
         )
+        lines.append(leg_dex.to_line())
+        if gas_used:
+            lines.append(f"  gas_used={gas_used}")
+    else:
+        lines.append("DEX (V3 range):")
+        v3 = result.get("v3_status") or {}
+        v3_pos_id = result.get("v3_position_id")
+        swap_done = bool(v3.get("is_executed"))
+        leg_dex = LegSummary(
+            venue="dex",
+            order_id_or_tx=f"position#{v3_pos_id}" if v3_pos_id is not None else None,
+            status=(
+                "EXECUTED"
+                if swap_done
+                else ("PENDING" if v3_pos_id is not None else "—")
+            ),
+            swap_executed=swap_done if v3 else None,
+            extra=dict(v3) if v3 else {},
+        )
+        lines.append(leg_dex.to_line())
+        if v3:
+            lines.append(
+                f"  liquidity={v3.get('liquidity')}  in_range={v3.get('in_range')}"
+            )
+
     lines.append("")
     lines.append(f"Outcome: {status}")
     if result.get("error"):
         lines.append(f"Error: {result['error']}")
+    if status == "TIMEOUT" and result.get("unwind_attempted"):
+        lines.append(
+            f"Unwind (MEXC): attempted=True success={result.get('unwind_success')}"
+        )
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     text = "\n".join(lines)
     if len(text) > TELEGRAM_MAX_LEN:

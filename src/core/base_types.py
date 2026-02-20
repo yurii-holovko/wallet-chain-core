@@ -120,6 +120,7 @@ class TransactionRequest:
     to: Address
     value: TokenAmount
     data: bytes
+    from_address: Optional[Address] = None
     nonce: Optional[int] = None
     gas_limit: Optional[int] = None
     max_fee_per_gas: Optional[int] = None
@@ -127,22 +128,24 @@ class TransactionRequest:
     chain_id: int = 1
 
     def to_dict(self) -> dict:
-        """Convert to web3-compatible dict."""
+        """Convert to web3-compatible dict with hex-encoded numerics for JSON-RPC."""
         payload: dict[str, object] = {
             "to": self.to.checksum,
-            "value": self.value.raw,
+            "value": hex(self.value.raw) if self.value.raw >= 0 else "0x0",
             "data": f"0x{self.data.hex()}",
         }
+        if self.from_address is not None:
+            payload["from"] = self.from_address.checksum
         if self.chain_id:
-            payload["chainId"] = self.chain_id
+            payload["chainId"] = hex(self.chain_id)
         if self.nonce is not None:
-            payload["nonce"] = self.nonce
+            payload["nonce"] = hex(self.nonce)
         if self.gas_limit is not None:
-            payload["gas"] = self.gas_limit
+            payload["gas"] = hex(self.gas_limit)
         if self.max_fee_per_gas is not None:
-            payload["maxFeePerGas"] = self.max_fee_per_gas
+            payload["maxFeePerGas"] = hex(self.max_fee_per_gas)
         if self.max_priority_fee is not None:
-            payload["maxPriorityFeePerGas"] = self.max_priority_fee
+            payload["maxPriorityFeePerGas"] = hex(self.max_priority_fee)
         return payload
 
 

@@ -13,7 +13,8 @@ Environment variables:
 Commands handled (from TELEGRAM_CHAT_ID only):
   /kill    — create the kill-switch file (bots will stop shortly)
   /resume  — remove the kill-switch file
-  /status  — report kill-switch and basic health status
+  /status  — report kill-switch and session summary (PnL, trades)
+  /stats   — report session total PnL and trade count
 """
 
 import logging
@@ -36,7 +37,8 @@ TELEGRAM_TEXT_MAX_LEN = 4000
 # Reply keyboard with three command buttons shown at the bottom of the chat
 REPLY_KEYBOARD = {
     "keyboard": [
-        [{"text": "/kill"}, {"text": "/status"}, {"text": "/resume"}],
+        [{"text": "/kill"}, {"text": "/resume"}],
+        [{"text": "/status"}, {"text": "/stats"}],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -213,4 +215,17 @@ class TelegramBot:
             elif text.startswith("/status"):
                 active = Path(KILL_SWITCH_FILE).exists()
                 status = "ACTIVE" if active else "inactive"
-                self.send(f"Kill switch status: {status}")
+                try:
+                    from session_stats import get_session_stats
+
+                    stats_line = get_session_stats().format_for_telegram()
+                    self.send(f"Kill switch: {status}\n{stats_line}")
+                except Exception:
+                    self.send(f"Kill switch: {status}")
+            elif text.startswith("/stats"):
+                try:
+                    from session_stats import get_session_stats
+
+                    self.send(get_session_stats().format_for_telegram())
+                except Exception:
+                    self.send("Session stats unavailable.")

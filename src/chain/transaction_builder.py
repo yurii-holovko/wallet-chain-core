@@ -137,6 +137,7 @@ class TransactionBuilder:
             to=self._state.to,
             value=self._state.value,
             data=self._state.data,
+            from_address=Address.from_string(self._wallet.address),
             nonce=self._state.nonce,
             gas_limit=self._state.gas_limit,
             max_fee_per_gas=self._state.max_fee_per_gas,

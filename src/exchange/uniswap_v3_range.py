@@ -277,7 +277,15 @@ class UniswapV3RangeOrderManager:
             amount0_desired = 0
             amount1_desired = amount_in
 
-        # Ensure allowance for token_in towards the position manager
+        # Resolve pool address BEFORE spending gas on an approve.
+        pool_addr = pool_cfg.pool_address
+        resolved_pool = self._resolve_pool(
+            token0, token1, fee_tier, preferred_pool=pool_addr
+        )
+        if resolved_pool is None:
+            raise ValueError("Could not resolve a Uniswap V3 pool for this pair/tier")
+
+        # Pool exists – ensure allowance for token_in towards the position manager
         owner = Address.from_string(self._wallet.address)
         self._ensure_allowance(
             token=token_in,
@@ -286,20 +294,27 @@ class UniswapV3RangeOrderManager:
             min_amount=amount_in,
         )
 
-        # Resolve pool address (prefer explicit config pool, else factory.getPool)
-        pool_addr = pool_cfg.pool_address
-        resolved_pool = self._resolve_pool(
-            token0, token1, fee_tier, preferred_pool=pool_addr
-        )
-        if resolved_pool is None:
-            raise ValueError("Could not resolve a Uniswap V3 pool for this pair/tier")
-
         # Current tick from pool slot0
         current_tick = self._get_current_tick(resolved_pool)
         tick_range: TickRange = single_tick_range(
             current_tick=current_tick,
             fee_tier=fee_tier,
             direction=direction,
+        )
+
+        logger.info(
+            "V3 mint: pool=%s dir=%s fee=%d tick=%d range=[%d,%d] "
+            "amt0=%d amt1=%d token0=%s token1=%s",
+            resolved_pool.checksum,
+            direction,
+            fee_tier,
+            current_tick,
+            tick_range.tick_lower,
+            tick_range.tick_upper,
+            amount0_desired,
+            amount1_desired,
+            token0.checksum,
+            token1.checksum,
         )
 
         deadline = int(time.time()) + 600  # 10 minutes

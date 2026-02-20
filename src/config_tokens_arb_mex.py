@@ -21,10 +21,10 @@ TOKEN_MAPPINGS: dict[str, dict] = {
         "address": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a",
         "mex_symbol": "GMXUSDT",
         "decimals": 18,
-        "fee_tier": 500,  # 0.05% - lower LP fee
+        "fee_tier": 3_000,  # 0.3% – verified GMX/USDC pool on Arbitrum
         "odos_supported": True,
         "active": True,
-        "v3_pool": "0x80A9ae39310abf666AEE7F735983b098e5c506Cf",
+        "v3_pool": "0x135e49cc315fed87f989e072ee11132686cf84f3",
         "category": "perp_dex",
     },
     "MAGIC": {
@@ -42,10 +42,10 @@ TOKEN_MAPPINGS: dict[str, dict] = {
         "address": "0x18c11FD286C5EC11c3b683Caa813B77f5163A122",
         "mex_symbol": "GNSUSDT",
         "decimals": 18,
-        "fee_tier": 3_000,
+        "fee_tier": 500,  # 0.05% – matches the GNS/USDC V3 pool
         "odos_supported": True,
         "active": True,
-        "v3_pool": "0xC89F6b6C5D5e9B7C5e0D5e6F7A8B9C0D1E2F3A4B",  # Verify
+        "v3_pool": "0xaa9e653252ed9e87a9bd545b974efbfb2f389f3f",  # GNS/USDC 0.05%
         "category": "perp_dex",
         "notes": "Gains Network, often 2-5% spreads during volatility",
     },
@@ -53,12 +53,16 @@ TOKEN_MAPPINGS: dict[str, dict] = {
         "address": "0x3082CC23568eA640225c2467653dB90e9250AaA0",
         "mex_symbol": "RDNTUSDT",
         "decimals": 18,
-        "fee_tier": 3_000,
+        # 1% – only USDC pool on V3 is 1% with very thin liquidity (~$228)
+        "fee_tier": 10_000,
         "odos_supported": True,
         "active": True,
-        "v3_pool": "0xD9e8c1C2C6b8E5F4a3B2C1D0E9F8A7B6C5D4E3F2A",  # Verify
+        # RDNT/USDC 1% (low liq)
+        "v3_pool": "0xd8d1dab77d3e89b17ec1f6b882a81f4fb12986ce",
         "category": "cross_chain_lending",
-        "notes": "LayerZero omnichain lending (Radiant) – your current best performer.",
+        # V3 USDC pool only ~$228 liq; range orders may not fill.
+        "notes": "Radiant (LayerZero). V3 USDC pool only ~$228 liq; "
+        "range orders may not fill.",
     },
     # === NEW: GAMEFI / NFT (high retail flow, CEX/DEX lag) ===
     "XAI": {
@@ -88,47 +92,56 @@ TOKEN_MAPPINGS: dict[str, dict] = {
         "address": "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8",
         "mex_symbol": "PENDLEUSDT",
         "decimals": 18,
-        "fee_tier": 3_000,
+        "fee_tier": 3_000,  # 0.3%
         "odos_supported": True,
         "active": True,
-        "v3_pool": "0xB2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1",  # Verify
+        # PENDLE/USDC 0.3% ($222K liq)
+        "v3_pool": "0xc6af8e73e2261264ef95466b97b13e03bd88165e",
         "category": "lst_yield",
         "notes": "Yield trading, complex mechanics confuse CEX bots",
     },
-    # === NEW: BRIDGE / CROSS-CHAIN (volatile during network stress) ===
+    # === BRIDGE / CROSS-CHAIN ===
     "STG": {
         "address": "0x6694340fc020c5E6B96567843da2df01b2CE1eb6",
         "mex_symbol": "STGUSDT",
         "decimals": 18,
         "fee_tier": 3_000,
         "odos_supported": True,
-        "active": True,
-        "v3_pool": "0xC3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2",  # Verify
+        # Disabled: no V3 USDC pool, ODOS routes 500K-1M gas → kills $5 micro-arb
+        "active": False,
+        "v3_pool": None,
         "category": "bridge",
-        "notes": "LayerZero cross-chain bridge (Stargate), same stack as RDNT.",
+        # ODOS-only with high gas; not viable for $5-10 micro-arb.
+        "notes": "Stargate (LayerZero). ODOS-only with high gas; "
+        "not viable for $5-10 micro-arb.",
     },
     # === NEW: BLUE-CHIP TOKENS WITH OCCASIONAL INEFFICIENCIES ===
     "LINK": {
         "address": "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4",
         "mex_symbol": "LINKUSDT",
         "decimals": 18,
-        "fee_tier": 500,  # 0.05%
+        # 0.3% – matches the USDC/LINK V3 pool
+        "fee_tier": 3_000,
         "odos_supported": True,
         "active": True,
-        # Placeholder V3 pool; range manager will validate / fallback via factory.
-        "v3_pool": "0x3dD1b8F2dB8E6E5eC5D5d6E7F8A9B0C1D2E3F4A5B",
+        # USDC/LINK 0.3% ($40K liq)
+        "v3_pool": "0xbbe36e6f0331c6a36ab44bc8421e28e1a1871c1e",
         "category": "oracle",
+        # Institutional flow can create short-lived CEX/DEX lags.
         "notes": "Chainlink; institutional flow can create short-lived CEX/DEX lags.",
     },
     "UNI": {
         "address": "0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0",
         "mex_symbol": "UNIUSDT",
         "decimals": 18,
-        "fee_tier": 500,  # 0.05%
+        # 0.3% – matches the USDC/UNI V3 pool
+        "fee_tier": 3_000,
         "odos_supported": True,
         "active": True,
-        "v3_pool": "0xC5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3D4",
+        # USDC/UNI 0.3% ($57K liq)
+        "v3_pool": "0x05477c22a5349cee601500da0489dad137fd6bfa",
         "category": "dex_token",
+        # Governance and listing events can cause spreads.
         "notes": "Uniswap token; governance and listing events can cause spreads.",
     },
     "AAVE": {
@@ -204,12 +217,15 @@ TOKEN_MAPPINGS: dict[str, dict] = {
         "address": "0x040d1EdC9569d4Bab2D15287Dc5A4F10F56a56B8",
         "mex_symbol": "BALUSDT",
         "decimals": 18,
-        "fee_tier": 500,  # 0.05%
+        "fee_tier": 3_000,
         "odos_supported": True,
-        "active": True,
+        # Disabled: avg ODOS gas 1.4M → route unreliable, always net-negative
+        "active": False,
         "v3_pool": None,
         "category": "dex_token",
-        "notes": "Balancer (veBAL); good for structural mispricing.",
+        # ODOS routes consistently 1.2-1.5M gas, net-negative at $5.
+        "notes": "No BAL/USDC V3 pool. ODOS routes consistently 1.2-1.5M gas, "
+        "net-negative at $5.",
     },
     # === DISABLED (keep for reference) ===
     "GRAIL": {

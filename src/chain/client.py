@@ -128,6 +128,11 @@ class ChainClient:
             return None
         return TransactionReceipt.from_web3(data)
 
+    def get_chain_id(self) -> int:
+        """Return the numeric chain ID reported by the RPC node."""
+        chain_hex = self._rpc_call("eth_chainId", [])
+        return _hex_to_int(chain_hex)
+
     def get_block(self, block: str, full: bool = False) -> dict:
         return self._rpc_call("eth_getBlockByNumber", [block, full])
 

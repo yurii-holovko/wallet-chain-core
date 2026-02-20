@@ -128,8 +128,20 @@ class ArbBot:
         self.simulation_mode = simulation_mode
         # Dry-run mode: run full pipeline but do NOT execute trades by default.
         self.dry_run = bool(config.get("dry_run", True))
-        self.sim_wallet_eth = config.get("sim_wallet_eth", 1.0)
-        self.sim_wallet_usdt = config.get("sim_wallet_usdt", 5000.0)
+        # Simulated CEX balances (e.g. MEXC $50 USDT, 0 ETH)
+        self.sim_cex_eth = float(
+            config.get("sim_cex_eth", os.getenv("SIM_CEX_ETH", "0"))
+        )
+        self.sim_cex_usdt = float(
+            config.get("sim_cex_usdt", os.getenv("SIM_CEX_USDT", "50"))
+        )
+        # Simulated wallet balances (e.g. Arbitrum $45 USDT + ~$5 ETH for gas)
+        self.sim_wallet_eth = float(
+            config.get("sim_wallet_eth", os.getenv("SIM_WALLET_ETH", "0.002"))
+        )
+        self.sim_wallet_usdt = float(
+            config.get("sim_wallet_usdt", os.getenv("SIM_WALLET_USDT", "45"))
+        )
         self.wallet: WalletManager | None = None
         self.chain_client: ChainClient | None = None
         self.dex_pricer: DexPricer | None = None
@@ -256,7 +268,9 @@ class ArbBot:
         logging.info("Bot starting... [exec=%s, dex_prices=%s]", exec_mode, price_mode)
         if self.simulation_mode:
             logging.info(
-                "Simulated wallet: %.2f ETH / %.0f USDT",
+                "Simulated balances — CEX: %.4f ETH / %.2f USDT; wallet: %.4f ETH / %.2f USDT",
+                self.sim_cex_eth,
+                self.sim_cex_usdt,
                 self.sim_wallet_eth,
                 self.sim_wallet_usdt,
             )
@@ -415,6 +429,9 @@ class ArbBot:
 
             ctx = await self.executor.execute(signal)
 
+            if not self.simulation_mode and self.wallet and self.chain_client:
+                await self._verify_balances(ctx)
+
             if self._execution_report_sender:
                 try:
                     self._execution_report_sender(format_cex_dex_execution_report(ctx))
@@ -479,17 +496,17 @@ class ArbBot:
 
     async def _sync_balances(self):
         if self.simulation_mode:
-            # In simulation mode, use fake balances — no API keys needed
+            # In simulation mode, use configurable fake balances (e.g. CEX $50 USDT, wallet $45 USDT + $5 ETH)
             sim_cex = {
                 "ETH": {
-                    "free": str(self.sim_wallet_eth),
+                    "free": str(self.sim_cex_eth),
                     "locked": "0",
-                    "total": str(self.sim_wallet_eth),
+                    "total": str(self.sim_cex_eth),
                 },
                 "USDT": {
-                    "free": str(self.sim_wallet_usdt),
+                    "free": str(self.sim_cex_usdt),
                     "locked": "0",
-                    "total": str(self.sim_wallet_usdt),
+                    "total": str(self.sim_cex_usdt),
                 },
             }
             self.inventory.update_from_cex(Venue.BINANCE, sim_cex)
@@ -559,6 +576,108 @@ class ArbBot:
         amount_raw = int.from_bytes(raw, "big") if raw else 0
         human = Decimal(amount_raw) / Decimal(10**decimals)
         return str(human)
+
+    async def _verify_balances(self, ctx):
+        """
+        After a trade, check actual CEX and wallet balances match expected
+        (inventory + trade effect). If mismatch > 0.001, log critical and stop.
+        """
+        signal = ctx.signal
+        pair = signal.pair
+        base = self._base_asset(pair)
+        quote = "USDT" if "USDT" in pair else pair.split("/")[1]
+
+        snap = self.inventory.snapshot()
+        venues = snap.get("venues", {})
+
+        def _venue_total(venue_key: str, asset: str) -> Decimal:
+            v = venues.get(venue_key, {})
+            a = v.get(asset, {})
+            if isinstance(a, dict):
+                return self.inventory._to_decimal(a.get("total", 0))
+            return Decimal("0")
+
+        expected_cex_base = _venue_total("binance", base)
+        expected_cex_quote = _venue_total("binance", quote)
+        expected_wallet_base = _venue_total("wallet", base)
+        expected_wallet_quote = _venue_total("wallet", quote)
+
+        if (
+            ctx.state == ExecutorState.DONE
+            and (ctx.leg1_fill_size or 0)
+            and (ctx.leg2_fill_size or 0)
+        ):
+            size1 = Decimal(str(ctx.leg1_fill_size or 0))
+            size2 = Decimal(str(ctx.leg2_fill_size or 0))
+            price1 = Decimal(str(ctx.leg1_fill_price or 0))
+            price2 = Decimal(str(ctx.leg2_fill_price or 0))
+            if ctx.leg1_venue == "cex":
+                expected_cex_base += size1
+                expected_cex_quote -= size1 * price1
+                expected_wallet_base -= size2
+                expected_wallet_quote += size2 * price2
+            else:
+                expected_wallet_base += size1
+                expected_wallet_quote -= size1 * price1
+                expected_cex_base -= size2
+                expected_cex_quote += size2 * price2
+
+        try:
+            cex_balances = self.exchange.fetch_balance()
+        except Exception as e:
+            logging.critical(
+                "Balance verification failed: could not fetch CEX balances: %s", e
+            )
+            self.stop()
+            return
+
+        def _cex_total(asset: str) -> Decimal:
+            entry = cex_balances.get(asset, {})
+            if isinstance(entry, dict):
+                return self.inventory._to_decimal(entry.get("total", 0))
+            return Decimal("0")
+
+        actual_cex_base = _cex_total(base)
+        actual_cex_quote = _cex_total(quote)
+
+        eth_balance = self.chain_client.get_balance(
+            Address.from_string(self.wallet.address)
+        )
+        actual_wallet_base = Decimal(str(eth_balance.human))
+        actual_wallet_quote = (
+            Decimal(
+                self._fetch_erc20_balance(
+                    token=self.dex_quote_token, decimals=self.dex_quote_decimals
+                )
+            )
+            if self.dex_quote_token
+            else Decimal("0")
+        )
+
+        tolerance = Decimal("0.001")
+        cex_base_diff = abs(actual_cex_base - expected_cex_base)
+        cex_quote_diff = abs(actual_cex_quote - expected_cex_quote)
+        wallet_base_diff = abs(actual_wallet_base - expected_wallet_base)
+        wallet_quote_diff = abs(actual_wallet_quote - expected_wallet_quote)
+
+        if (
+            cex_base_diff > tolerance
+            or cex_quote_diff > tolerance
+            or wallet_base_diff > tolerance
+            or wallet_quote_diff > tolerance
+        ):
+            logging.critical(
+                "BALANCE MISMATCH! CEX %s diff=%s, CEX %s diff=%s; wallet %s diff=%s, wallet %s diff=%s",
+                base,
+                cex_base_diff,
+                quote,
+                cex_quote_diff,
+                base,
+                wallet_base_diff,
+                quote,
+                wallet_quote_diff,
+            )
+            self.stop()
 
     @staticmethod
     def _base_asset(pair: str) -> str:
@@ -766,9 +885,9 @@ class PaperBot:
             self.trades.append(trade)
 
             dir_label = (
-                "CEX→DEX" if direction == Direction.BUY_CEX_SELL_DEX else "DEX→CEX"
+                "CEX->DEX" if direction == Direction.BUY_CEX_SELL_DEX else "DEX->CEX"
             )
-            pnl_icon = "✅" if net_pnl > 0 else "❌"
+            pnl_icon = "+" if net_pnl > 0 else "-"
             print(
                 f"  {pnl_icon} PAPER TRADE #{len(self.trades):>3}  "
                 f"{dir_label}  {self.trade_size} {pair.split('/')[0]}  "
@@ -853,7 +972,7 @@ class PaperBot:
 
         for i, t in enumerate(self.trades[-10:], start=max(1, len(self.trades) - 9)):
             dir_label = (
-                "CEX→DEX" if t.direction == Direction.BUY_CEX_SELL_DEX else "DEX→CEX"
+                "CEX->DEX" if t.direction == Direction.BUY_CEX_SELL_DEX else "DEX->CEX"
             )
             print(
                 f"  {i:>4}  {t.time_str:>8}  {dir_label:>7}  {t.size:>6.3f}  "
@@ -881,8 +1000,10 @@ def _build_simulation_config() -> dict:
         "pairs": ["ETH/USDT"],
         "trade_size": 0.05,
         "simulation": True,
-        "sim_wallet_eth": 1.0,
-        "sim_wallet_usdt": 5000.0,
+        "sim_cex_eth": float(os.getenv("SIM_CEX_ETH", "0")),
+        "sim_cex_usdt": float(os.getenv("SIM_CEX_USDT", "50")),
+        "sim_wallet_eth": float(os.getenv("SIM_WALLET_ETH", "0.002")),
+        "sim_wallet_usdt": float(os.getenv("SIM_WALLET_USDT", "45")),
         "gas_cost_usd": 0.10,
         "min_score": 30.0,
         "signal_config": {
@@ -942,15 +1063,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["simulation", "paper", "double_limit"],
+        choices=["simulation", "paper", "mexc_v3", "double_limit"],
         default="simulation",
         help=(
             "simulation   — fake DEX prices, frequent trades, full pipeline\n"
             "               (scoring, inventory, circuit breaker, recovery)\n"
             "paper        — REAL CEX + DEX prices, simulated execution,\n"
             "               live PnL dashboard with trade log\n"
-            "double_limit — Arbitrum/MEXC Double Limit micro-arb dry-run\n"
-            "               (same behavior as scripts/demo_double_limit.py)"
+            "mexc_v3     — MEXC + Uniswap V3 arb dry-run (formerly double_limit)\n"
+            "               (same behavior as scripts/demo_double_limit.py)\n"
+            "double_limit — Deprecated alias for mexc_v3"
         ),
     )
     parser.add_argument(
@@ -958,7 +1080,7 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help=(
-            "Trade size in USD (for double_limit mode). "
+            "Trade size in USD (for mexc_v3 / double_limit mode). "
             "Default: 5.0 (from TRADE_SIZE_USD env var or config). "
             "Common values: 5.0, 10.0"
         ),
@@ -968,7 +1090,37 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Place real orders (both legs: MEXC limit + Uniswap V3 range). "
-            "Only for double_limit mode. Default: observation only."
+            "Only for mexc_v3 / double_limit mode. Default: observation only."
+        ),
+    )
+    parser.add_argument(
+        "--simulate-execution",
+        action="store_true",
+        help=(
+            "Simulate MEXC+V3 execution (two legs, fills/timeouts) without real orders. "
+            "Only for mexc_v3 / double_limit mode."
+        ),
+    )
+    parser.add_argument(
+        "--max-trades",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "MEXC+V3 arb only: stop after N successful trades (e.g. 1 for one transaction). "
+            "Default: run until Ctrl+C."
+        ),
+    )
+    parser.add_argument(
+        "--tokens",
+        type=str,
+        default=None,
+        metavar="TOKEN1,TOKEN2,...",
+        help=(
+            "MEXC+V3 arb only: comma-separated list of token symbols to track "
+            "(e.g. 'LINK,ARB,GMX'). Can also be set via TRACKED_TOKENS env var. "
+            "Default: all active and ODOS-supported tokens. "
+            "Available tokens: ARB, GMX, MAGIC, GNS, RDNT, PENDLE, LINK, UNI, BAL, STG, etc."
         ),
     )
     args = parser.parse_args()
@@ -1019,15 +1171,23 @@ if __name__ == "__main__":
                 bot.stop()
                 bot._print_summary()
 
-        elif args.mode == "double_limit":
-            # Run the Double Limit micro-arb demo. Use --execute to place real orders.
+        elif args.mode in ("mexc_v3", "double_limit"):
+            # Run the MEXC + Uniswap V3 arb demo (formerly Double Limit).
             try:
                 trade_size = args.trade_size if args.trade_size is not None else None
+                tokens = None
+                if args.tokens:
+                    tokens = [
+                        t.strip().upper() for t in args.tokens.split(",") if t.strip()
+                    ]
                 asyncio.run(
                     double_limit_main(
                         trade_size_usd=trade_size,
                         enable_live_execution=args.execute,
+                        simulate_execution=args.simulate_execution,
                         telegram_bot=tg if tg.config.enabled else None,
+                        max_trades=args.max_trades,
+                        tokens=tokens,
                     )
                 )
             except KeyboardInterrupt:

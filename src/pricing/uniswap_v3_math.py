@@ -60,26 +60,32 @@ def single_tick_range(
     current_tick: int,
     fee_tier: int,
     direction: str = "above",
+    width_multiplier: int = 10,
 ) -> TickRange:
     """
-    Compute a single-tick range for a range order.
+    Compute a tick range for a range order.
 
     direction:
-      * 'above' → [current, current + spacing]  (limit sell at a higher price)
-      * 'below' → [current - spacing, current]  (limit buy at a lower price)
+      * 'above' → [current, current + width]  (limit sell at a higher price)
+      * 'below' → [current - width, current]  (limit buy at a lower price)
+
+    width_multiplier: Number of tick spacings for the range width. Default 10
+    keeps computed liquidity within uint128 at high ticks; 1 = single-tick
+    (can overflow or round to zero for small amounts).
     """
     spacing = TICK_SPACING.get(fee_tier)
     if spacing is None:
         raise ValueError(f"Unsupported fee tier for V3 tick spacing: {fee_tier}")
 
+    width = max(1, int(width_multiplier)) * spacing
     current_usable = nearest_usable_tick(current_tick, fee_tier)
     direction_norm = direction.lower()
 
     if direction_norm == "above":
         tick_lower = current_usable
-        tick_upper = current_usable + spacing
+        tick_upper = current_usable + width
     elif direction_norm == "below":
-        tick_lower = current_usable - spacing
+        tick_lower = current_usable - width
         tick_upper = current_usable
     else:
         raise ValueError(f"direction must be 'above' or 'below', got {direction!r}")

@@ -77,6 +77,42 @@ class MexcClient:
         self._session = requests.Session()
         self._max_retries = max_retries
         self._backoff_base = backoff_base
+        self._time_offset_ms: int = 0
+        self._sync_server_time()
+
+    # ── clock sync ──────────────────────────────────────────────────
+
+    def _sync_server_time(self) -> None:
+        """Fetch MEXC server time and compute local-vs-server offset."""
+        try:
+            local_before = time.time()
+            resp = self._session.get(
+                f"{self._base_url}/api/v3/time", timeout=self._timeout
+            )
+            local_after = time.time()
+            if resp.status_code == 200:
+                server_ms = resp.json().get("serverTime", 0)
+                local_ms = int(((local_before + local_after) / 2) * 1000)
+                self._time_offset_ms = server_ms - local_ms
+                if abs(self._time_offset_ms) > 500:
+                    logger.warning(
+                        "MEXC clock offset: %+d ms (local is %s)",
+                        self._time_offset_ms,
+                        "behind" if self._time_offset_ms > 0 else "ahead",
+                    )
+                else:
+                    logger.debug("MEXC clock offset: %+d ms", self._time_offset_ms)
+            else:
+                logger.warning(
+                    "Could not fetch MEXC server time (HTTP %d), using local clock",
+                    resp.status_code,
+                )
+        except Exception as exc:
+            logger.warning("MEXC server time sync failed (%s), using local clock", exc)
+
+    def _server_time_ms(self) -> int:
+        """Return current timestamp in ms, adjusted for MEXC server clock."""
+        return int(time.time() * 1000) + self._time_offset_ms
 
     # ── low-level helpers ──────────────────────────────────────────
 
@@ -116,54 +152,8 @@ class MexcClient:
         params: Optional[Dict[str, Any]] = None,
         signed: bool = False,
     ) -> Dict[str, Any]:
-        url = f"{self._base_url}{endpoint}"
-        params = dict(params or {})
-
-        if signed:
-            # Generate timestamp in milliseconds (epoch * 1000) as Long/int
-            # This must match exactly what MEXC expects
-            now = time.time()
-            req_time = int(now * 1000)
-            params["timestamp"] = req_time
-            params.setdefault("recvWindow", 5_000)
-
-            # Generate signature BEFORE adding it to params
-            # Signature is computed from query string WITHOUT the signature field
-            signature = self._sign(params)
-            params["signature"] = signature
-
-            # For GET requests, manually construct query string to ensure exact match
-            # between what we sign and what we send
-            query_for_sign = None
-            if method == "GET":
-                # Build query string manually to match signature exactly
-                query_parts = []
-                for k, v in sorted(params.items()):
-                    if v is None:
-                        continue
-                    query_parts.append(f"{k}={v}")
-                query_string = "&".join(query_parts)
-                url = f"{url}?{query_string}"
-                params = {}  # Clear params since we're using query string in URL
-                query_for_sign = query_string.split("&signature=")[0]
-            else:
-                # For POST/DELETE, build query string for logging
-                query_for_sign = "&".join(
-                    f"{k}={v}"
-                    for k, v in sorted(params.items())
-                    if k != "signature" and v is not None
-                )
-
-            # Debug logging for signature generation
-            sig_short = signature[:16] + "..." if len(signature) > 16 else signature
-            logger.debug(
-                "MEXC signed: endpoint=%s method=%s query=%s ts=%d sig=%s",
-                endpoint,
-                method,
-                query_for_sign,
-                req_time,
-                sig_short,
-            )
+        base_url = f"{self._base_url}{endpoint}"
+        orig_params = dict(params or {})
 
         headers = {
             "X-MEXC-APIKEY": self._api_key,
@@ -172,19 +162,51 @@ class MexcClient:
         attempt = 0
         while True:
             attempt += 1
+
+            if signed:
+                send_params: Dict[str, Any] = dict(orig_params)
+                req_time = self._server_time_ms()
+                send_params["timestamp"] = req_time
+                send_params.setdefault("recvWindow", 10_000)
+
+                signature = self._sign(send_params)
+                send_params["signature"] = signature
+
+                query_parts = []
+                for k, v in sorted(send_params.items()):
+                    if v is None:
+                        continue
+                    query_parts.append(f"{k}={v}")
+                query_string = "&".join(query_parts)
+                url = f"{base_url}?{query_string}"
+                req_params: Dict[str, Any] = {}
+                query_for_sign = query_string.split("&signature=")[0]
+
+                sig_short = signature[:16] + "..." if len(signature) > 16 else signature
+                logger.debug(
+                    "MEXC signed: endpoint=%s method=%s query=%s ts=%d sig=%s",
+                    endpoint,
+                    method,
+                    query_for_sign,
+                    req_time,
+                    sig_short,
+                )
+            else:
+                url = base_url
+                req_params = dict(orig_params)
+
             try:
                 if method == "GET":
                     resp = self._session.get(
-                        url, params=params, headers=headers, timeout=self._timeout
+                        url, params=req_params, headers=headers, timeout=self._timeout
                     )
                 elif method == "DELETE":
                     resp = self._session.delete(
-                        url, params=params, headers=headers, timeout=self._timeout
+                        url, params=req_params, headers=headers, timeout=self._timeout
                     )
                 else:
-                    # For MEXC spot we send params in query as well
                     resp = self._session.post(
-                        url, params=params, headers=headers, timeout=self._timeout
+                        url, params=req_params, headers=headers, timeout=self._timeout
                     )
             except requests.RequestException as exc:
                 if attempt > self._max_retries:
@@ -208,11 +230,27 @@ class MexcClient:
                     payload = {"message": resp.text}
                 message = payload.get("msg") or payload.get("message") or str(payload)
                 code = payload.get("code")
+                msg_lower = str(message).lower()
+
+                # Auto-resync clock on timestamp drift and retry once
+                if (
+                    resp.status_code == 400
+                    and ("recvwindow" in msg_lower or "timestamp" in msg_lower)
+                    and attempt <= self._max_retries
+                ):
+                    logger.warning(
+                        "MEXC timestamp drift detected, re-syncing clock and retrying"
+                    )
+                    self._sync_server_time()
+                    continue
+
                 # Log detailed error info for signature errors
                 if resp.status_code == 400 and (
-                    "signature" in str(message).lower() or code in (602, 700002)
+                    "signature" in msg_lower or code in (602, 700002)
                 ):
-                    query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                    query_str = "&".join(
+                        f"{k}={v}" for k, v in sorted(orig_params.items())
+                    )
                     logger.error(
                         "MEXC signature error: endpoint=%s status=%d code=%s "
                         "msg=%s query=%s",
@@ -282,6 +320,19 @@ class MexcClient:
 
     # ── public API: trading ────────────────────────────────────────
 
+    @staticmethod
+    def _order_param_number(value: float, decimals: int = 8) -> str:
+        """
+        Format price/quantity as string so MEXC signature matches
+        (avoid float drift).
+        """
+        from decimal import ROUND_DOWN, Decimal
+
+        d = Decimal(str(value))
+        quantize = Decimal(10) ** -decimals
+        trimmed = d.quantize(quantize, rounding=ROUND_DOWN).normalize()
+        return str(trimmed)
+
     def place_limit_order(
         self,
         symbol: str,
@@ -297,12 +348,14 @@ class MexcClient:
         application level: if the order is immediately executed (takes
         liquidity), we cancel it and raise ``MexcApiError``.
         """
+        # MEXC expects consistent string format for price/quantity
+        # so signature validates
         params: Dict[str, Any] = {
             "symbol": symbol,
             "side": side.upper(),
             "type": "LIMIT",
-            "quantity": quantity,
-            "price": price,
+            "quantity": self._order_param_number(quantity),
+            "price": self._order_param_number(price),
             "timeInForce": "GTC",
         }
         raw = self._request("POST", "/api/v3/order", params=params, signed=True)

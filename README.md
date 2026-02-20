@@ -1033,12 +1033,12 @@ Instead of external price feeds, Week 5 uses **direct venue data**:
 
 In code:
 
-- `scripts/demo_double_limit.py`:
+- `scripts/demo_double_limit.py` (MEXC + V3 arb, formerly “Double Limit”):
   - pulls MEXC order books via `MexcClient.get_order_book()` (`src/exchange/mexc_client.py`),
   - pulls DEX quotes via `OdosClient.quote()` (`src/pricing/odos_client.py`),
   - loops every few seconds and logs spreads + **net** PnL for a curated token universe from `config_tokens_arb_mex.py`.
 
-#### Layer 3 — Execution Engine (Double Limit)
+#### Layer 3 — Execution Engine (MEXC + V3 Arb)
 
 Core micro-arb logic lives in `src/executor/double_limit_engine.py`:
 
@@ -1083,7 +1083,7 @@ Capital and bridging policy are encapsulated in `src/core/capital_manager.py`:
   - `starting_cex_usd`, `starting_chain_usd`,
   - `bridge_threshold_usd` (e.g. $20),
   - `bridge_fixed_cost_usd` (e.g. $0.05 — actual MEXC withdrawal fee for USDT on Arbitrum One).
-- The Double Limit engine pulls an **amortized bridge cost per trade** from `get_effective_bridge_cost()`, so micro trades are only considered if they can dilute fixed costs.
+- The MEXC+V3 engine pulls an **amortized bridge cost per trade** from `get_effective_bridge_cost()`, so micro trades are only considered if they can dilute fixed costs.
 - **Cost verification**: Run `python scripts/verify_all_costs.py` to verify gas costs, bridge fees, and LP fees match actual market conditions.
 
 ---
@@ -1131,7 +1131,7 @@ if self.dry_run:
 
 For Week 5, you typically:
 
-- use `--mode double_limit` (observation-only micro-arb),
+- use `--mode mexc_v3` (observation-only MEXC + V3 arb; `double_limit` remains as a deprecated alias),
 - or `--mode simulation`/`paper` with `dry_run=True` to exercise the full state machine without real orders.
 
 #### Kill Switch (File + Telegram)
@@ -1209,7 +1209,7 @@ To wire alerts to Slack/Telegram/etc., point `WEBHOOK_URLS` to your bridge endpo
 
 #### 1. Configure `.env`
 
-Minimum required for Double Limit dry run:
+Minimum required for MEXC + V3 dry run:
 
 ```env
 # Arbitrum + ODOS + MEXC
@@ -1224,7 +1224,7 @@ MEXC_BASE_URL=https://api.mexc.com
 
 # ODOS has no API key, just base URL in OdosClient
 
-# Double Limit parameters
+# MEXC + V3 arb parameters (formerly “Double Limit”)
 TRADE_SIZE_USD=5.0
 MIN_SPREAD_PCT=0.0075
 MIN_PROFIT_USD=0.001
@@ -1262,19 +1262,19 @@ This prints a **TOKEN VERIFICATION REPORT** and a JSON **CONFIG PATCH FOR FAILED
 - "Withdrawal" permission enabled (not just "View deposit/withdrawal details"),
 - IP address matches bound IP (if IP binding is enabled).
 
-#### 3. Start Double Limit dry run
+#### 3. Start MEXC + V3 dry run
 
 Use the unified entrypoint:
 
 ```bash
 # Default trade size ($5.0 from TRADE_SIZE_USD env var or config)
-python scripts/arb_bot.py --mode double_limit
+python scripts/arb_bot.py --mode mexc_v3
 
 # Custom trade size ($10.0)
-python scripts/arb_bot.py --mode double_limit --trade-size 10.0
+python scripts/arb_bot.py --mode mexc_v3 --trade-size 10.0
 
 # Or use $5.0 explicitly
-python scripts/arb_bot.py --mode double_limit --trade-size 5.0
+python scripts/arb_bot.py --mode mexc_v3 --trade-size 5.0
 ```
 
 **Trade size options**:
@@ -1287,7 +1287,7 @@ What this does:
 
 - Starts structured logging and metrics.
 - Starts the Telegram bot (if configured).
-- Delegates to `scripts/demo_double_limit.py`:
+- Delegates to `scripts/demo_double_limit.py` (MEXC + V3 arb, formerly “Double Limit”):
   - Calls `DoubleLimitArbitrageEngine.evaluate_opportunity()` for each token.
   - Logs:
     - MEXC bid/ask,
